@@ -43,6 +43,8 @@ environment.
 
 from __future__ import annotations
 
+import os
+
 import argparse
 import sys
 from pathlib import Path
@@ -127,6 +129,11 @@ def run_one(
     )
     breakdown = estimate_peak_vram_gb(inp)
     predicted_gb = breakdown.total_gb
+    # Surfaced so the table can say WHICH accounting produced each row. A
+    # fallback row is rank-blind by construction, so three LoRA rows at
+    # different ranks showing the same prediction is expected there and a
+    # BUG in an "exact" row — without this column the two look identical.
+    accounting = "exact" if trainable_params is not None else "fallback-1%"
 
     measured_gb: Optional[float] = None
     try:
@@ -146,6 +153,8 @@ def run_one(
         pass  # torch not installed in this environment — prediction still works
 
     return {
+        "accounting": accounting,
+        "trainable_params": trainable_params,
         "model_dir": model_dir,
         "seq_len": seq_len,
         "batch_size": batch_size,
@@ -196,6 +205,40 @@ _SWEEP_POINTS = [
 ]
 
 
+def _synthesize_checkpoint() -> "Optional[str]":
+    """A tiny but STRUCTURALLY REAL Llama-shaped checkpoint, so shape
+    discovery and rank-aware accounting run against genuine tensor metadata
+    rather than a mock. Returns None if numpy/safetensors are unavailable,
+    in which case the caller falls back to the 1% path and the table says so.
+    """
+    try:
+        import numpy as np
+        from safetensors.numpy import save_file
+    except ImportError:
+        return None
+
+    import tempfile
+
+    hidden, inter, kv, layers = 256, 688, 64, 4
+    tensors = {}
+    for layer in range(layers):
+        for name, (out_f, in_f) in {
+            "self_attn.q_proj": (hidden, hidden),
+            "self_attn.k_proj": (kv, hidden),
+            "self_attn.v_proj": (kv, hidden),
+            "self_attn.o_proj": (hidden, hidden),
+            "mlp.gate_proj": (inter, hidden),
+            "mlp.up_proj": (inter, hidden),
+            "mlp.down_proj": (hidden, inter),
+        }.items():
+            tensors[f"model.layers.{layer}.{name}.weight"] = np.zeros(
+                (out_f, in_f), dtype=np.float32
+            )
+    out_dir = tempfile.mkdtemp(prefix="kadhi_vram_validation_")
+    save_file(tensors, os.path.join(out_dir, "model.safetensors"))
+    return out_dir
+
+
 def main() -> int:
     args = parse_args()
 
@@ -206,10 +249,31 @@ def main() -> int:
     except ImportError:
         cuda_available = False
 
+    # The exact-accounting path only engages for a LOCAL checkpoint (that is
+    # deliberate — see docs/adaptation-controller-plan.md §1.1: the predictor
+    # never fetches over the network). If the caller pointed at a bare model
+    # NAME, every LoRA row would silently use the rank-blind 1% fallback and
+    # the table would show identical predictions at r=4, 16 and 64 — which
+    # looks exactly like the rank-blindness defect this harness exists to
+    # confirm is fixed. Synthesise a small real checkpoint instead, so the
+    # default run exercises the path it claims to validate.
+    model_dir = args.model_dir
+    synthesized = None
+    if not os.path.isdir(model_dir):
+        synthesized = _synthesize_checkpoint()
+        if synthesized is not None:
+            model_dir = synthesized
+            print(
+                f"NOTE: {args.model_dir!r} is not a local directory, so a small "
+                f"synthetic checkpoint was generated at {model_dir} to exercise "
+                "the exact-accounting path. Pass --model-dir <real checkpoint> "
+                "to sweep against a real model.\n"
+            )
+
     rows = []
     for quant, peft, lora_r in _SWEEP_POINTS:
         row = run_one(
-            args.model_dir,
+            model_dir,
             seq_len=args.seq_len,
             batch_size=args.batch_size,
             quant=quant,
@@ -220,13 +284,19 @@ def main() -> int:
         )
         rows.append(row)
 
-    header = f"{'quant':<8} {'peft':<6} {'r':>4} {'predicted_gb':>14} {'measured_gb':>12}"
+    header = (
+        f"{'quant':<8} {'peft':<6} {'r':>4} {'trainable':>12} "
+        f"{'accounting':>12} {'predicted_gb':>14} {'measured_gb':>12}"
+    )
     print(header)
     print("-" * len(header))
     for row in rows:
         measured = "n/a" if row["measured_gb"] is None else f"{row['measured_gb']:.2f}"
+        tp = row.get("trainable_params")
+        tp_s = "n/a" if tp is None else f"{tp:,}"
         print(
             f"{row['quant']:<8} {row['peft']:<6} {row['lora_r']:>4} "
+            f"{tp_s:>12} {row.get('accounting', '?'):>12} "
             f"{row['predicted_gb']:>14.3f} {measured:>12}"
         )
 

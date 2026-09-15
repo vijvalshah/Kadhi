@@ -406,3 +406,105 @@ resource model is correct, and the stopping decisions are defensible with number
 | Sensitivity ranking is unstable across probe seeds | Medium | Probe stability is measured in phase 3 and reported; fall back to the static signals if it fails |
 | Activation memory dominates and rank becomes irrelevant to feasibility | Medium | Expected on long sequences. Phase 1 quantifies the regime where rank matters; the budget is stated in trainable parameters and wall-clock, not VRAM alone |
 | Layer streaming interacts with partial freezing in unmodelled ways | Medium | Phase 1 sweep includes streaming configurations explicitly |
+
+---
+
+## Part 5 — Running this on another machine
+
+Everything below runs **without a GPU and without torch**, except where marked. The
+controller's whole static path is pure Python plus numpy/safetensors.
+
+### Get the branch
+
+```bash
+git clone https://github.com/vijvalshah/Kadhi.git
+cd Kadhi
+git checkout adaptation-controller
+pip install -e ".[train]"     # or: pip install -e . for the light core
+```
+
+The light core is enough for everything except the two hardware harnesses in the last
+section. If `pip install -e .` is not wanted, every command below also works with
+`PYTHONPATH=src` in front of it.
+
+### 1. Run the test suite
+
+```bash
+python -m pytest tests/test_capacity.py tests/test_allocate.py tests/test_plan.py \
+  tests/test_feasibility.py tests/test_sensitivity.py tests/test_allocate_cmd.py \
+  tests/test_hardware_fit_capacity_wiring.py tests/test_v0640_part_d.py -q
+```
+
+Expect **215 passed, 4 skipped** (that is this exact file list; the wider suite
+including the pre-existing config/CLI tests this branch touches is 291 passed). The 4 skips are the torch-dependent numerical tests
+in `test_sensitivity.py`; they will RUN (not skip) on a machine with a working torch,
+and that is the first thing this branch has never been able to check — if they fail
+there, that is a real finding and not a flake.
+
+### 2. Reproduce the algorithm claims
+
+```bash
+python benchmarks/harness/allocator_optimality.py
+```
+
+Re-derives every number quoted about the allocator: exhaustive-search optimality,
+where the guarantee stops, how much the previous algorithm lost, and the budget
+invariant. Takes a few seconds, needs nothing but Python.
+
+### 3. Drive the controller end to end
+
+Needs a real local checkpoint. Any small one works:
+
+```bash
+huggingface-cli download HuggingFaceTB/SmolLM2-135M --local-dir ./smol
+```
+
+```yaml
+# kadhi.yaml
+base: ./smol
+task: sft
+data:
+  train: ./train.jsonl
+  format: chatml
+training:
+  lora:
+    r: 8
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+controller:
+  enabled: true
+  budget:
+    trainable_params: 4000000
+    vram_gb: 4.0
+```
+
+```bash
+kadhi allocate --config kadhi.yaml --explain
+```
+
+Prints the per-layer rank pattern, the frozen modules, and the predicted VRAM
+breakdown. Exit code 0 = feasible, 3 = not feasible (the message distinguishes "budget
+too small" from "cannot fit at any rank").
+
+### 4. The two things that need real hardware
+
+These are the open items. Both harnesses are written and have never been run.
+
+```bash
+# Needs a CUDA GPU. Validates the peak-VRAM predictor against measurement.
+python benchmarks/harness/vram_predictor_validation.py
+
+# Needs torch (CPU is fine). Measures the seed-to-seed noise floor and the
+# two baselines the allocator must beat.
+python benchmarks/harness/seed_variance.py --rows 40 --seeds 0,1,2,3,4 --out seeds.json
+```
+
+What to report back, in priority order:
+
+1. Whether the 4 skipped `test_sensitivity.py` tests pass with a real torch. The
+   gradient probe's numerical behaviour has never been executed.
+2. `vram_predictor_validation.py` output — specifically whether predicted peak tracks
+   measured peak, and whether the activation term under-predicts as §1.2 predicts. If
+   it does, the safety margin must be re-derived before the feasibility gate can be
+   trusted.
+3. `seed_variance.py` output — the measured spread. Nothing in Phase 3's quality claims
+   can be judged until that number exists.
