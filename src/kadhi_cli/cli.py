@@ -398,6 +398,18 @@ app.command(
     ),
 )(_plan_cmd.apply_cmd)
 
+# Adaptation Controller Phase 3 — importance-driven LoRA rank allocation.
+from kadhi_cli.commands import allocate as _allocate_cmd  # noqa: E402
+
+app.command(
+    name="allocate",
+    help=(
+        "Allocate LoRA rank per layer from the checkpoint's own weights "
+        "under controller.budget, checked against the VRAM ceiling "
+        "(Adaptation Controller — see docs/adaptation-controller.md)."
+    ),
+)(_allocate_cmd.allocate_cmd)
+
 # v0.64.0 Part C — Hermetic env lockfile.
 from kadhi_cli.commands.env import env_app as _env_app  # noqa: E402
 

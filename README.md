@@ -152,7 +152,7 @@ Work is split into four independently shippable phases:
 |---|---|---|
 | 1 | Exact LoRA capacity accounting; peak-VRAM predictor validated against measurement | Capacity accounting + predictor wiring built and tested; hardware validation run pending |
 | 2 | Seed-variance harness; noise floor and baseline numbers | Harness built; run on real hardware pending |
-| 3 | Layer sensitivity probe; capacity allocator emitting `lora.rank_pattern`; `kadhi allocate` | Probe, allocator, and a real static end-to-end pipeline built and tested; feasibility loop + CLI command pending |
+| 3 | Layer sensitivity probe; capacity allocator emitting `lora.rank_pattern`; `kadhi allocate` | Built and tested end to end, including the CLI command, in static (spectral-SNR) mode; swapping in the already-built gradient probe as the score source is the remaining upgrade |
 | 4 | In-place rank growth; frontier reporting | Stretch |
 
 **Contributing:** [adaptation-controller.md](docs/adaptation-controller.md) is the

@@ -237,11 +237,17 @@ project pivots to the resource-model contribution alone.
 
 ### Phase 3 — Sensitivity probe and allocator
 
-**Status: every component built and tested except the feasibility loop and the
-CLI surface. The full pipeline runs today in a STATIC mode (no gradient probe,
-no live model, no dataset) and produces a real `rank_pattern` from real
-spectral math on a real checkpoint — verified, not asserted, in
-`tests/test_plan.py`.**
+**Status: every listed component is built and tested, including the
+feasibility loop and the `kadhi allocate` CLI command. A user can run
+`kadhi allocate --config kadhi.yaml --explain` against a real local
+checkpoint today and get back a real `rank_pattern`, checked against the
+VRAM ceiling, in STATIC mode (spectral SNR, no gradient probe, no live
+model, no training dataset) — verified end to end, not asserted, in
+`tests/test_allocate_cmd.py` via the real Typer CLI. The two remaining
+open items are upgrading the score source to the gradient probe
+(`utils/sensitivity.py`, already built but not wired into this command)
+and the "done when" quality claims below, which need Phase 2's noise floor
+first.**
 
 **Build**
 - `utils/sensitivity.py` — short warmup probe, `|∂L/∂W ⊙ W|` per layer, normalised by
@@ -278,10 +284,22 @@ spectral math on a real checkpoint — verified, not asserted, in
 - `controller:` configuration block. **Built** (schema-only, mirroring the
   `AdviseConfig` precedent exactly) — validated, tested, and its example YAML
   in `adaptation-controller.md` §4 round-trips through the real schema.
-- `kadhi allocate --explain` CLI surface. **Not built.** Note the rename from
+- `kadhi allocate --explain` CLI surface. **Built and tested end to end**
+  (`commands/allocate.py`, registered in `cli.py`) — loads a real
+  `kadhi.yaml`, requires `controller.enabled` and a `trainable_params`
+  budget, requires the base model to already be a local directory (no
+  network fetch, consistent with the Phase 1 resource-model design), then
+  runs `build_static_plan` inside `fit_plan_to_budget` and reports whether
+  the result fits under `controller.budget.vram_gb`. `--explain` prints the
+  full `rank_pattern`, the frozen modules, and the predicted VRAM breakdown.
+  Verified with `typer.testing.CliRunner` against a real synthetic
+  safetensors checkpoint — 7 tests, including exit-code checks for the
+  infeasible case and every validation failure mode. Note the rename from
   the earlier `kadhi plan` — that name is already a shipped, unrelated
   command (a Terraform-shape cost/VRAM/drift pre-flight summary); this was
   caught while starting the CLI wiring, before it became a real collision.
+  Still static-signal-only — the gradient probe is not wired into this
+  command, per this section's earlier note.
 - Correlation report between the probe and the two static layer signals.
   `sensitivity.correlate_with_static_signals` exists and is tested; nothing
   yet calls it from a live run, since that requires the gradient probe to
