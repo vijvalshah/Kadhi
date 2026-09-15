@@ -1,0 +1,68 @@
+# Security Policy
+
+## Supported Versions
+
+Security fixes are shipped for the latest published release. We recommend always
+running the most recent version from PyPI (`pip install -U kadhi-cli`).
+
+| Version | Supported          |
+| ------- | ------------------ |
+| 0.75.x  | :white_check_mark: |
+| < 0.75  | :x:                |
+
+## Reporting a Vulnerability
+
+Please report security issues **privately** — do not open a public GitHub issue
+for anything security-sensitive.
+
+- Preferred: email **team@trykadhi.dev** (the project address), or
+  **makazanalpamys@gmail.com** (the maintainer's personal address) if that bounces.
+  Please do not report security issues in Discord — it is a public channel.
+
+We aim to acknowledge reports within 5 business days and to ship a fix or
+mitigation for confirmed, in-scope issues as promptly as is practical. When
+reporting, please include:
+
+- the affected version(s) and platform,
+- a minimal reproduction or proof of concept,
+- the impact you observed.
+
+## Scope
+
+Kadhi is a local-first CLI for fine-tuning LLMs. The threat model assumes the
+operator runs Kadhi on their own machine with their own data. Representative
+in-scope issues:
+
+- path traversal or arbitrary file read/write from user-supplied config,
+  dataset, or artifact paths;
+- SSRF in the synthetic-data providers, inference server, or hub/endpoint
+  validators;
+- command, Modelfile, Jinja chat-template, or systemd/launchd unit injection;
+- secret leakage in logs, crash bundles, or generated artifacts;
+- sandbox escape in the RLVR code-execution reward path.
+
+Out of scope:
+
+- vulnerabilities in third-party model weights or datasets you choose to load;
+- issues that require an already-compromised host;
+- DNS and email configuration of `trykadhi.dev` — a missing or permissive
+  DMARC / SPF / DKIM record, and anything else established by a public DNS
+  query. These are worth fixing and we do fix them, but they are not findings
+  in Kadhi and they are not eligible for anything.
+
+### Telemetry and Network Egress
+
+Kadhi is local-first. Telemetry is strictly **opt-in** (disabled by default) via `KADHI_TELEMETRY=1` and can be overridden per invocation with `--no-telemetry`. When enabled, telemetry transmits anonymous, hardware-only environment metadata (OS, architecture, Python version, command name sanitized against registered commands) via HTTPS. It never collects model weights, dataset contents, file paths, configurations, or secrets. See the [Privacy Policy](docs/backends-and-ops.md#privacy-policy) for complete details.
+
+**There is no bug bounty and no monetary reward.** We credit reporters by name
+in the release notes, which is the whole of what we offer. Reports that open
+with a request for payment get this paragraph as the reply.
+
+## Disclosure
+
+We practice coordinated disclosure. Once a fix is released we credit the
+reporter in the release notes, unless anonymity is requested.
+
+> A detailed, per-version log of historical security hardening previously lived
+> in this file. It now lives in the project's git history and in
+> [CHANGELOG.md](CHANGELOG.md).

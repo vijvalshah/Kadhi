@@ -1,0 +1,937 @@
+"""Shared PEFT wiring helpers — LoRA config, multi-trainer ReLoRA, and patches.
+
+Centralises PEFT LoRA construction plus the v0.39.0 Part B (ReLoRA callback)
+and Part D (surgical PEFT patches) wiring previously inlined only in the SFT
+trainer. Every Transformers-backend trainer calls these helpers from its setup
+and training paths.
+
+Helpers swallow per-patch exceptions at DEBUG level — best-effort by design;
+training never crashes because a Gemma4 swap or 3-D dropout strip failed.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+# PEFT 0.20 has no automatic LoRA mapping for the Qwen3.5 text architectures.
+# Qwen3.5 mixes fused linear-attention blocks with ordinary attention blocks,
+# so the policy covers the input/output projections of both block kinds.
+QWEN35_TEXT_LORA_TARGETS = (
+    "q_proj",
+    "v_proj",
+    "in_proj_qkv",
+    "out_proj",
+)
+
+# Qwen4-Exp combines ordinary QSA projections, fused Gated DeltaNet
+# projections, shared experts, PLE projections, and gated-residual mixers.
+# PEFT has no qwen4_exp_text default mapping yet. A short suffix list would
+# silently omit one of those new paths, so ``all-linear`` is the deliberate
+# text-decoder policy. The routed experts themselves are 3-D nn.Parameters,
+# not nn.Linear modules; adapting those needs PEFT ``target_parameters`` and is
+# tracked separately from this safe linear-module baseline.
+QWEN4_EXP_TEXT_LORA_TARGETS = "all-linear"
+
+# Qwen4-Exp's routed experts keep their projections as two raw 3-D
+# ``nn.Parameter`` tensors per decoder layer. ``all-linear`` cannot see them;
+# PEFT 0.20's ``target_parameters`` path can adapt both, with the expert axis at
+# dimension zero.
+QWEN4_EXP_TEXT_LORA_TARGET_PARAMETERS = (
+    "mlp.experts.gate_up_proj",
+    "mlp.experts.down_proj",
+)
+
+
+def _model_types(model: Any) -> set[Any]:
+    """Return outer/text model types without importing Transformers."""
+    config = getattr(model, "config", model)
+    text_config = getattr(config, "text_config", None)
+    return {
+        getattr(config, "model_type", None),
+        getattr(text_config, "model_type", None),
+    }
+
+
+def resolve_lora_target_modules(model: Any, configured: Any) -> Any:
+    """Resolve ``target_modules: auto`` for models PEFT does not know yet.
+
+    Existing architectures remain delegated to PEFT by returning ``None``.
+    Explicit user targets are returned unchanged. Qwen3.5 uses a wrapper
+    config (``qwen3_5``) around ``qwen3_5_text`` and its MoE counterpart, so
+    inspect both configs without importing Transformers or PEFT at module load.
+    Qwen4-Exp's causal-LM loader exposes ``qwen4_exp_text`` directly.
+    """
+    if configured != "auto" and configured != ["auto"]:
+        return configured
+
+    model_types = _model_types(model)
+    if model_types & {
+        "qwen3_5",
+        "qwen3_5_text",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+    }:
+        return list(QWEN35_TEXT_LORA_TARGETS)
+    if "qwen4_exp_text" in model_types:
+        return QWEN4_EXP_TEXT_LORA_TARGETS
+    return None
+
+
+def resolve_lora_target_parameters(model: Any, configured: Any) -> Any:
+    """Resolve opt-in raw-parameter LoRA targets for supported architectures.
+
+    ``None`` and an empty list disable raw-parameter targeting. Explicit lists
+    always win unchanged. ``auto`` fails closed on unknown architectures so a
+    user cannot request expert adaptation and silently train only modules.
+    """
+    if configured is None or configured == []:
+        return configured
+    if configured != "auto":
+        return configured
+    if "qwen4_exp_text" in _model_types(model):
+        return list(QWEN4_EXP_TEXT_LORA_TARGET_PARAMETERS)
+    raise ValueError(
+        "training.lora.target_parameters='auto' has no mapping for model_type="
+        f"{sorted(str(value) for value in _model_types(model) if value is not None)!r}; "
+        "provide an explicit parameter-name list or omit target_parameters"
+    )
+
+
+def build_lora_config_kwargs(
+    lora_cfg: Any,
+    *,
+    target_modules: Any,
+    target_parameters: Any,
+    task_type: Any,
+) -> dict[str, Any]:
+    """Build the shared PEFT LoRA kwargs used by every trainer path."""
+    kwargs = {
+        "r": lora_cfg.r,
+        "lora_alpha": lora_cfg.alpha,
+        "lora_dropout": lora_cfg.dropout,
+        "target_modules": target_modules,
+        "target_parameters": target_parameters,
+        "task_type": task_type,
+        "bias": "none",
+        "use_dora": lora_cfg.use_dora,
+        "use_rslora": lora_cfg.use_rslora,
+    }
+    rank_pattern = lora_cfg.rank_pattern
+    alpha_pattern = lora_cfg.alpha_pattern
+    if rank_pattern:
+        kwargs["rank_pattern"] = dict(rank_pattern)
+    if alpha_pattern:
+        kwargs["alpha_pattern"] = dict(alpha_pattern)
+    return kwargs
+
+
+def build_lora_config(
+    lora_cfg: Any,
+    *,
+    target_modules: Any,
+    task_type: Any,
+    target_parameters: Any = None,
+) -> Any:
+    """Build a PEFT ``LoraConfig`` through the single shared kwargs path.
+
+    Keeping the PEFT import inside this function preserves Kadhi's lazy-import
+    boundary while ensuring every trainer consumes new shared LoRA fields such
+    as ``rank_pattern`` and ``alpha_pattern`` automatically.
+    """
+    from peft import LoraConfig
+
+    return LoraConfig(
+        **build_lora_config_kwargs(
+            lora_cfg,
+            target_modules=target_modules,
+            target_parameters=target_parameters,
+            task_type=task_type,
+        )
+    )
+
+
+def apply_pre_lora_patches(model: Any, base: str) -> None:
+    """Run pre-LoRA surgical patches (v0.39.0 Part D, multi-trainer in v0.40.6).
+
+    Qwen4-Exp's compatibility patch is fail-closed because an unpatched legacy
+    Torch forward cannot train. Gemma4's best-effort ``ClippableLinear`` ->
+    ``nn.Linear`` swap remains gated by ``is_gemma4_model(base)``.
+    """
+    from kadhi_cli.utils.qwen4_compat import apply_qwen4_exp_scatter_compat
+
+    apply_qwen4_exp_scatter_compat(model)
+
+    from kadhi_cli.utils.peft_patches import apply_gemma4_clippable_patch, is_gemma4_model
+
+    if not is_gemma4_model(base):
+        return
+    try:
+        apply_gemma4_clippable_patch(model)
+    except Exception as exc:  # noqa: BLE001 — best-effort patch, log + continue
+        logger.debug("apply_gemma4_clippable_patch skipped: %s", exc)
+
+
+def apply_post_lora_patches(model: Any) -> None:
+    """Run post-LoRA surgical patches (v0.39.0 Part D, multi-trainer in v0.40.6).
+
+    Currently: 3-D fused-MoE expert dropout strip. Architecture-detected via
+    ``weight.ndim == 3`` inside the helper; safe to call unconditionally.
+    """
+    from kadhi_cli.utils.peft_patches import strip_lora_dropout_for_3d_experts
+
+    try:
+        strip_lora_dropout_for_3d_experts(model)
+    except Exception as exc:  # noqa: BLE001 — best-effort patch, log + continue
+        logger.debug("strip_lora_dropout_for_3d_experts skipped: %s", exc)
+
+
+def attach_relora_callback(trainer: Any, tcfg: Any) -> bool:
+    """Attach :class:`ReLoRACallback` when ``training.relora_steps`` is set.
+
+    Returns ``True`` when a callback was attached, ``False`` otherwise.
+    The schema-level cross-validator (``_validate_relora_supported_tasks``)
+    already enforces the transformer-backend requirement, so this helper
+    trusts the caller's task/backend.
+    """
+    relora_steps = getattr(tcfg, "relora_steps", None)
+    # Use `is None` (not `not relora_steps`) so a schema-bypassing caller that
+    # passes `relora_steps=0` surfaces as a loud `ReLoRAPolicy` ValueError
+    # rather than a silent skip. Matches project policy (v0.34.0 / v0.39.0).
+    if relora_steps is None:
+        return False
+    # Pydantic schema guarantees these fields exist on `TrainingConfig`. Read
+    # them directly so a misnamed attr fails loudly with `AttributeError`.
+    from kadhi_cli.utils.relora import ReLoRACallback, ReLoRAPolicy
+
+    policy = ReLoRAPolicy(
+        steps=int(relora_steps),
+        warmup_ratio=float(tcfg.relora_warmup_ratio),
+        reset_optimizer=bool(tcfg.relora_reset_optimizer),
+        prune_ratio=float(tcfg.relora_prune_ratio),
+    )
+    trainer.add_callback(ReLoRACallback(policy=policy))
+    return True
+
+
+def attach_loraplus_optimizer(trainer: Any, tcfg: Any) -> bool:
+    """Attach a PEFT LoRA+ optimizer when ``training.loraplus_lr_ratio`` is set.
+
+    LoRA+ is not a ``TrainingArguments`` field — it belongs to PEFT's optimizer
+    construction (``create_loraplus_optimizer``), which gives the LoRA B matrices
+    a learning rate of ``lr * loraplus_lr_ratio`` while A stays at ``lr``.
+    Forwarding it into ``TrainingArguments`` raised ``TypeError`` before the first
+    step, so the advertised option always crashed (#724).
+
+    Assigning ``trainer.optimizer`` here is respected because
+    ``Trainer.create_optimizer`` builds one only when ``self.optimizer is None``,
+    and the scheduler is still built from it with the configured warmup/schedule.
+    The optimizer class and its betas/eps come from the run's configured optimizer
+    via ``Trainer.get_optimizer_cls_and_kwargs``, so LoRA+ uses the same optimizer
+    the user asked for; weight decay is applied through PEFT's own
+    ``loraplus_weight_decay`` (the plain ``weight_decay`` kwarg is ignored by
+    ``create_loraplus_optimizer``).
+
+    Returns ``True`` when an optimizer was attached, ``False`` otherwise.
+    """
+    ratio = getattr(tcfg, "loraplus_lr_ratio", None)
+    if ratio is None:
+        return False
+
+    # GaLore projects full-parameter gradients; LoRA+ tunes LoRA A/B matrices.
+    # They cannot both own the optimizer — fail loudly rather than let this
+    # silently override the GaLore optimizer set on TrainingArguments.
+    if getattr(tcfg, "use_galore", False):
+        raise ValueError(
+            "training.loraplus_lr_ratio is mutually exclusive with "
+            "training.use_galore: LoRA+ tunes LoRA A/B matrices while GaLore "
+            "projects full-parameter gradients. Enable one, not both."
+        )
+
+    from peft import PeftModel
+    from peft.optimizers import create_loraplus_optimizer
+    from transformers import Trainer
+
+    model = trainer.model
+    if not isinstance(model, PeftModel):
+        raise ValueError(
+            "training.loraplus_lr_ratio requires a LoRA (PEFT) model, but the "
+            "active run has no adapter. Add a lora config or remove "
+            "loraplus_lr_ratio."
+        )
+
+    optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(trainer.args)
+    # create_loraplus_optimizer takes lr explicitly and re-inserts it into the
+    # per-group kwargs itself; drop the duplicate so it is not passed twice.
+    optimizer_kwargs.pop("lr", None)
+    trainer.optimizer = create_loraplus_optimizer(
+        model=model,
+        optimizer_cls=optimizer_cls,
+        lr=trainer.args.learning_rate,
+        loraplus_lr_ratio=float(ratio),
+        loraplus_weight_decay=trainer.args.weight_decay,
+        **optimizer_kwargs,
+    )
+    return True
+
+
+def apply_lisa_setup(model: Any, tcfg: Any, console: Any = None) -> bool:
+    """Prepare ``model`` for LISA full fine-tuning (v0.71.34 #267, #307).
+
+    Returns ``True`` when LISA is enabled (the caller must then SKIP its LoRA
+    path entirely), ``False`` otherwise.
+
+    The model is deliberately left FULLY trainable here: HF builds the
+    optimizer before the first callback fires, so every decoder parameter has
+    to be in a param group for :class:`~kadhi_cli.utils.lisa.LisaCallback` to be
+    able to re-activate it later. The callback then flips ``requires_grad``
+    each interval — frozen parameters produce no gradient and AdamW skips
+    them. ``enable_input_require_grads`` keeps gradient checkpointing working
+    without a LoRA adapter, exactly as the Spectrum branch does.
+
+    Centralised (rather than inlined per trainer) for the same reason
+    ``block_expansion.apply_block_expansion_if_configured`` is: the SFT and
+    pretrain trainers must not drift on what "LISA is on" means.
+    """
+    if not getattr(tcfg, "lisa_enabled", False):
+        return False
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    if console is not None:
+        console.print(
+            f"[green]LISA:[/] layerwise importance sampling "
+            f"({tcfg.lisa_num_layers} layer(s) every "
+            f"{tcfg.lisa_interval_steps} steps, LoRA off)"
+        )
+    return True
+
+
+def attach_lisa_callback(trainer: Any, tcfg: Any) -> bool:
+    """Attach :class:`LisaCallback` when ``training.lisa_enabled`` is set.
+
+    Returns ``True`` when a callback was attached, ``False`` otherwise. The
+    schema-level cross-validator (``_validate_lisa_compat``) already enforces
+    the ``_LISA_SUPPORTED_TASKS`` / transformers / text / quantization=none
+    gate and mutual exclusion, so this helper trusts the caller's task/backend
+    (v0.71.34 #267; ``pretrain`` added in #307).
+    """
+    if not getattr(tcfg, "lisa_enabled", False):
+        return False
+    from kadhi_cli.utils.lisa import LisaCallback, LisaPolicy
+
+    # Read schema fields directly (they are guaranteed to exist on
+    # TrainingConfig) so a misnamed attr fails loudly — mirrors
+    # attach_relora_callback. seed is a fixed 0 (LISA reproducibility does not
+    # need a user knob today; add a schema field if that changes).
+    policy = LisaPolicy(
+        num_layers=int(tcfg.lisa_num_layers),
+        interval_steps=int(tcfg.lisa_interval_steps),
+        reset_optimizer=bool(tcfg.lisa_reset_optimizer),
+        seed=0,
+        train_embeddings=bool(tcfg.lisa_train_embeddings),
+    )
+    trainer.add_callback(LisaCallback(policy=policy))
+    return True
+
+
+def attach_curriculum_callback(
+    trainer: Any,
+    tcfg: Any,
+    output_dir: str,
+    console: Any = None,
+) -> bool:
+    """Attach :class:`DynamicCurriculumCallback` when ``curriculum_dynamic=true``.
+
+    Returns ``True`` when attached, ``False`` otherwise. The schema-level
+    cross-validator (``_validate_curriculum_dynamic_supported``) gates by
+    backend / task, so this helper trusts the caller's config.
+
+    Args:
+        trainer: HF Trainer (or duck-typed equivalent with ``add_callback``).
+        tcfg: ``KadhiConfig.training`` model.
+        output_dir: Directory under cwd to write
+            ``curriculum_history.jsonl`` (the BETA history record).
+        console: Optional Rich Console for the BETA advisory.
+    """
+    if not getattr(tcfg, "curriculum_dynamic", False):
+        return False
+    # Lazy import — the callback module touches transformers + torch.
+    from kadhi_cli.monitoring.curriculum_callback import (
+        DynamicCurriculumCallback,
+    )
+    from kadhi_cli.utils.curriculum_dynamic import DynamicCurriculumPolicy
+
+    policy = DynamicCurriculumPolicy(
+        num_buckets=int(tcfg.curriculum_buckets),
+        recompute_every_n_steps=int(
+            getattr(tcfg, "curriculum_dynamic_recompute_steps", 50) or 50
+        ),
+        floor=float(getattr(tcfg, "curriculum_dynamic_floor", 0.05) or 0.05),
+        temperature=float(
+            getattr(tcfg, "curriculum_dynamic_temperature", 1.0) or 1.0
+        ),
+    )
+    # v0.71.5 #149 — thread curriculum_metric so the callback can bucket by
+    # loss / perplexity percentile (round-robin fallback for `length`). Any
+    # value that is not one of the three valid metrics (e.g. a missing field
+    # or a test MagicMock) falls back to `length` so the callback always
+    # constructs.
+    curriculum_metric = getattr(tcfg, "curriculum_metric", "length")
+    if curriculum_metric not in ("length", "perplexity", "loss"):
+        curriculum_metric = "length"
+    try:
+        callback = DynamicCurriculumCallback(
+            policy=policy,
+            output_dir=output_dir,
+            curriculum_metric=curriculum_metric,
+        )
+    except (TypeError, ValueError) as exc:
+        logger.debug("attach_curriculum_callback rejected: %s", exc)
+        return False
+    trainer.add_callback(callback)
+    if console is not None:
+        try:
+            console.print(
+                "[yellow]BETA:[/yellow] dynamic curriculum callback attached "
+                f"(buckets={policy.num_buckets}, recompute_every="
+                f"{policy.recompute_every_n_steps})"
+            )
+        except Exception:  # noqa: BLE001 — never crash on console issues.
+            pass
+    return True
+
+
+def attach_grpo_stability_callback(trainer: Any, tcfg: Any) -> bool:
+    """Attach :class:`GRPOStabilityCallback` when any v0.50.0 Part D knob is set.
+
+    Returns ``True`` when a callback was attached, ``False`` otherwise.
+    Mirrors the v0.40.6 / v0.53.5 / v0.53.6 callback-attach pattern.
+
+    The schema-level cross-validator already gates these fields to
+    ``task='grpo'`` on non-mlx backends, so this helper trusts the caller.
+    """
+    stability_fields = (
+        "ref_model_ema_alpha",
+        "replay_buffer_size",
+        "async_grpo_prefetch",
+        "tis_threshold",
+        "mask_truncated_completions",
+        "defer_rerolling",
+        "skip_zero_advantage",
+        "off_policy_mask_threshold",
+    )
+    # `is None` policy (matches v0.40.6 review-fix policy on `attach_relora_callback`)
+    has_any = False
+    for field_name in stability_fields:
+        val = getattr(tcfg, field_name, None)
+        # bools count as set when True; numeric fields count when not None.
+        if isinstance(val, bool):
+            if val:
+                has_any = True
+                break
+        elif val is not None:
+            has_any = True
+            break
+    if not has_any:
+        return False
+    from kadhi_cli.monitoring.grpo_stability_callback import GRPOStabilityCallback
+
+    try:
+        callback = GRPOStabilityCallback(
+            ref_model_ema_alpha=tcfg.ref_model_ema_alpha,
+            replay_buffer_size=tcfg.replay_buffer_size,
+            async_grpo_prefetch=bool(tcfg.async_grpo_prefetch),
+            tis_threshold=tcfg.tis_threshold,
+            mask_truncated_completions=bool(tcfg.mask_truncated_completions),
+            defer_rerolling=bool(tcfg.defer_rerolling),
+            skip_zero_advantage=bool(tcfg.skip_zero_advantage),
+            off_policy_mask_threshold=tcfg.off_policy_mask_threshold,
+        )
+    except (TypeError, ValueError) as exc:
+        logger.debug("attach_grpo_stability_callback rejected: %s", exc)
+        return False
+    trainer.add_callback(callback)
+    return True
+
+
+def rl_callbacks_need_buffer(tcfg: Any) -> bool:
+    """True when a reward-fn capture buffer is needed (v0.71.11 #235/#240).
+
+    The reward-hack + echo-trap callbacks observe the GRPO step's rewards
+    + completions through the shared
+    :class:`~kadhi_cli.utils.rl_signal_buffer.RLSignalBuffer`. The
+    RL-checkpoint callback does not.
+    """
+    return (
+        getattr(tcfg, "reward_hack_detector", None) is not None
+        or bool(getattr(tcfg, "echo_trap_enabled", False))
+        or getattr(tcfg, "reward_hack_mitigation", "off") != "off"
+    )
+
+
+def _attach_reward_hack(
+    trainer: Any,
+    tcfg: Any,
+    *,
+    buffer: Any,
+    tokenizer: Any,
+    output_dir: str,
+    task: str,
+    rl_checkpoint_cb: Any = None,
+) -> int:
+    """Attach the reward-hack callback: mitigation controller (v0.71.26) when a
+    ``reward_hack_mitigation`` mode is set, else the plain v0.70.0 detector.
+
+    Returns 1 when a callback was attached, 0 otherwise. The mitigation
+    controller SUBSUMES the plain detector (they share the same signal), so
+    exactly one of the two is ever attached. ``rl_checkpoint_cb`` is the
+    (already-built) RL-checkpoint callback the pid_lagrangian rollback ladder
+    restores from.
+    """
+    import os
+
+    detector = getattr(tcfg, "reward_hack_detector", None)
+    mitigation = getattr(tcfg, "reward_hack_mitigation", "off")
+    if mitigation != "off" and detector is not None:
+        from kadhi_cli.utils.reward_hack_control import (
+            BangBangPolicy,
+            MitigationLogWriter,
+            PIDLagrangianPolicy,
+            RewardHackMitigationCallback,
+        )
+
+        try:
+            writer = MitigationLogWriter(
+                os.path.join(output_dir, "mitigation_log.jsonl")
+            )
+            signals = tuple(
+                getattr(tcfg, "reward_hack_signals", None) or ("info_rm",)
+            )
+            bang_bang = None
+            pid = None
+            if mitigation == "kl_control":
+                bang_bang = BangBangPolicy(
+                    beta_floor=tcfg.reward_hack_beta_floor,
+                    beta_ceil=tcfg.reward_hack_beta_ceil,
+                    trip_band=tcfg.reward_hack_trip_band,
+                    release_band=tcfg.reward_hack_release_band,
+                    dwell_steps=tcfg.reward_hack_dwell_steps,
+                    release_patience=tcfg.reward_hack_release_patience,
+                    kl_gain=tcfg.reward_hack_kl_gain,
+                )
+            elif mitigation == "pid_lagrangian":
+                pid = PIDLagrangianPolicy(
+                    kp=tcfg.reward_hack_pid_kp,
+                    ki=tcfg.reward_hack_pid_ki,
+                    kd=tcfg.reward_hack_pid_kd,
+                    signal_target=tcfg.reward_hack_signal_target,
+                    beta_floor=tcfg.reward_hack_beta_floor,
+                    beta_ceil=tcfg.reward_hack_beta_ceil,
+                    integral_clamp=tcfg.reward_hack_integral_clamp,
+                )
+            callback = RewardHackMitigationCallback(
+                mode=mitigation,
+                detector=detector,
+                log_writer=writer,
+                signals=signals,
+                buffer=buffer,
+                tokenizer=tokenizer,
+                task=task,
+                bang_bang=bang_bang,
+                pid=pid,
+                rollback=bool(getattr(tcfg, "reward_hack_rollback", False)),
+                rollback_patience=int(
+                    getattr(tcfg, "reward_hack_rollback_patience", 3)
+                ),
+                max_recovery_attempts=int(
+                    getattr(tcfg, "reward_hack_max_recovery_attempts", 2)
+                ),
+                rl_checkpoint_cb=rl_checkpoint_cb,
+                smoothing=getattr(tcfg, "reward_hack_signal_smoothing", "none"),
+                smoothing_window=int(
+                    getattr(tcfg, "reward_hack_smoothing_window", 8)
+                ),
+                conservative_on_disagreement=bool(
+                    getattr(tcfg, "reward_hack_conservative_on_disagreement", False)
+                ),
+            )
+            trainer.add_callback(callback)
+            callback.attach(trainer)
+            return 1
+        except (TypeError, ValueError, OSError) as exc:
+            # A user explicitly enabled mitigation — a silent drop would leave
+            # them believing a safety controller is active when it is not.
+            # Warn LOUDLY (e.g. output dir outside cwd fails the log writer).
+            logger.warning(
+                "reward-hack mitigation callback NOT attached (%s): %s. "
+                "Training will proceed WITHOUT mitigation.",
+                type(exc).__name__,
+                exc,
+            )
+            return 0
+    if detector is not None:
+        from kadhi_cli.utils.reward_hacking import build_reward_hack_callback
+
+        try:
+            trainer.add_callback(
+                build_reward_hack_callback(
+                    detector=detector,
+                    halt_on_hack=bool(getattr(tcfg, "reward_hack_halt", False)),
+                    buffer=buffer,
+                )
+            )
+            return 1
+        except (TypeError, ValueError) as exc:
+            logger.debug("attach reward-hack callback rejected: %s", exc)
+            return 0
+    return 0
+
+
+def attach_rl_callbacks(
+    trainer: Any,
+    tcfg: Any,
+    *,
+    buffer: Any = None,
+    tokenizer: Any = None,
+    output_dir: str = ".",
+    task: str = "grpo",
+) -> int:
+    """Attach the v0.71.11 live RL callbacks; return how many were attached.
+
+    Wires (when their schema fields are set):
+    - reward-hacking detector (#235) — reads ``buffer``.
+    - echo-trap detector (#240) — reads ``buffer`` + ``tokenizer``.
+    - mid-epoch RL checkpoint (#238) — saves under ``output_dir``.
+
+    The schema cross-validators already gate these fields to RL tasks on
+    non-mlx backends, so this helper trusts the caller's config.
+    """
+    attached = 0
+    # Build the RL-checkpoint callback FIRST so the pid_lagrangian rollback
+    # ladder can be handed a reference to restore from.
+    ckpt_cb = _build_rl_checkpoint_cb(tcfg, output_dir=output_dir, task=task)
+    if ckpt_cb is not None:
+        trainer.add_callback(ckpt_cb)
+        attached += 1
+
+    attached += _attach_reward_hack(
+        trainer,
+        tcfg,
+        buffer=buffer,
+        tokenizer=tokenizer,
+        output_dir=output_dir,
+        task=task,
+        rl_checkpoint_cb=ckpt_cb,
+    )
+
+    if bool(getattr(tcfg, "echo_trap_enabled", False)):
+        from kadhi_cli.utils.echo_trap import build_echo_trap_callback
+
+        try:
+            trainer.add_callback(
+                build_echo_trap_callback(
+                    threshold=float(getattr(tcfg, "echo_trap_threshold", 0.6)),
+                    halt_on_trap=bool(getattr(tcfg, "echo_trap_halt", False)),
+                    tokenizer_aware=bool(
+                        getattr(tcfg, "echo_trap_tokenizer_aware", False)
+                    ),
+                    buffer=buffer,
+                    tokenizer=tokenizer,
+                )
+            )
+            attached += 1
+        except (TypeError, ValueError) as exc:
+            logger.debug("attach echo-trap callback rejected: %s", exc)
+
+    return attached
+
+
+def _build_rl_checkpoint_cb(tcfg: Any, *, output_dir: str, task: str) -> Any:
+    """Build the mid-epoch RL-checkpoint callback (or None if not configured)."""
+    save_every = getattr(tcfg, "rl_checkpoint_save_every_steps", None)
+    if save_every is None:
+        return None
+    from kadhi_cli.utils.rl_checkpoint import (
+        RLCheckpointConfig,
+        build_rl_checkpoint_callback,
+    )
+
+    try:
+        ckpt_cfg = RLCheckpointConfig(
+            save_every_steps=int(save_every),
+            include_optimizer_state=bool(
+                getattr(tcfg, "rl_checkpoint_include_optimizer", True)
+            ),
+            include_ref_model=bool(
+                getattr(tcfg, "rl_checkpoint_include_ref_model", False)
+            ),
+            include_rollout_buffer=bool(
+                getattr(tcfg, "rl_checkpoint_include_rollout_buffer", False)
+            ),
+            keep_last=int(getattr(tcfg, "rl_checkpoint_keep_last", 3)),
+        )
+        return build_rl_checkpoint_callback(
+            ckpt_cfg, output_dir=output_dir, task=task
+        )
+    except (TypeError, ValueError) as exc:
+        logger.debug("build RL-checkpoint callback rejected: %s", exc)
+        return None
+
+
+def attach_plugin_callback(trainer: Any, console: Any = None) -> bool:
+    """Attach :class:`KadhiPluginCallback` when any enabled plugin implements a hook.
+
+    Returns ``True`` when a callback was attached, ``False`` otherwise
+    (no plugins enabled OR none implement any hook — the build helper
+    short-circuits to ``None`` in that case so the trainer pays zero
+    overhead).
+
+    Failures inside individual plugin hooks are swallowed at WARNING
+    inside the callback itself; this helper only handles the
+    construction failure path (transformers not importable / plugin
+    registry corrupted).
+    """
+    try:
+        from kadhi_cli.monitoring.plugin_callback import build_plugin_callback
+
+        callback = build_plugin_callback()
+    except Exception as exc:  # noqa: BLE001 — plugin infra must not crash training
+        logger.debug("attach_plugin_callback skipped: %s", exc)
+        return False
+    if callback is None:
+        return False
+    try:
+        trainer.add_callback(callback)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("attach_plugin_callback add_callback failed: %s", exc)
+        return False
+    if console is not None:
+        try:
+            # Number of plugins is the count of distinct (plugin_name, hooks)
+            # pairs the callback snapshot will fan out to.
+            from kadhi_cli.plugins import list_plugins
+
+            n_enabled = sum(1 for s in list_plugins().values() if s.enabled)
+            console.print(
+                f"[dim]Plugin callback attached ({n_enabled} enabled plugin(s)).[/]"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return True
+
+
+#: torch.compile wraps the module and every state-dict key gains this segment.
+_COMPILE_PREFIX = "_orig_mod."
+
+
+def strip_compile_prefix(output_dir: str) -> int:
+    """Rewrite a saved adapter's keys to their canonical, loadable form.
+
+    #335 — under ``training.use_fsdp2_compile`` the HF Trainer saves through the
+    ``torch.compile`` wrapper, so every key comes out as
+    ``_orig_mod.base_model.model...`` instead of ``base_model.model...``. The
+    tensors are genuinely trained, but ``PeftModel.from_pretrained`` matches none
+    of them: it emits ``UserWarning: Found missing adapter keys`` and leaves
+    ``lora_B`` at its zero initialisation, so the adapter is a no-op. Measured on
+    4xH100: **0 of 96** non-zero against 96/96 for the paired non-compile run,
+    reproduced 3/3, with the run exiting 0 throughout.
+
+    Returns the number of keys rewritten — 0 when there was nothing to do, which
+    is the ordinary case and must stay a no-op rather than a rewrite of every
+    run's adapter file.
+    """
+    import os
+
+    path = os.path.join(output_dir, "adapter_model.safetensors")
+    if not os.path.isfile(path):
+        # full fine-tuning writes no adapter; a completed run must not end in a
+        # crash just because there is nothing here to normalise
+        return 0
+
+    import tempfile
+
+    from safetensors.torch import load_file, save_file
+
+    tensors = load_file(path)
+    if not any(key.startswith(_COMPILE_PREFIX) for key in tensors):
+        return 0
+
+    rewritten = {}
+    changed = 0
+    for key, value in tensors.items():
+        # clone: load_file MEMORY-MAPS the file, and writing over a live mapping
+        # fails on Windows with `os error 1224` (the same trap adapter_fuse.py
+        # documents for an in-place save_pretrained). Cloning detaches the
+        # tensors from the mapping so it can be released before the write.
+        target = key[len(_COMPILE_PREFIX):] if key.startswith(_COMPILE_PREFIX) else key
+        if target != key:
+            changed += 1
+        rewritten[target] = value.clone()
+    if len(rewritten) != len(tensors):
+        raise ValueError(
+            "stripping the torch.compile prefix would collide two adapter keys; "
+            "the checkpoint carries both spellings of the same weight"
+        )
+    del tensors
+
+    # atomic: a half-written adapter is worse than the prefixed one, which at
+    # least still holds the trained numbers
+    handle, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(path) or ".", suffix=".safetensors"
+    )
+    os.close(handle)
+    try:
+        save_file(rewritten, tmp_path)
+        os.replace(tmp_path, path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+    return changed
+
+
+def _build_compile_prefix_callback_class() -> type:
+    """Construct ``CompilePrefixCallback`` with transformers as its parent.
+
+    Built inside a function rather than at module scope so importing this module
+    stays free of transformers: every transformer-backend trainer imports it for
+    the ``attach_*`` helpers above, and today that import pulls in neither
+    transformers nor torch. Mirrors
+    ``monitoring/plugin_callback._build_callback_class``.
+    """
+    from rich.markup import escape
+    from transformers import TrainerCallback
+
+    class CompilePrefixCallback(TrainerCallback):
+        """Normalise each ``checkpoint-*`` adapter as the Trainer writes it.
+
+        #351: :func:`strip_compile_prefix` ran once, on ``self._output_dir``
+        after the final ``save_model``. The HF Trainer writes its periodic
+        checkpoints through that SAME ``save_model``, with
+        ``output_dir=<run>/checkpoint-N``, so they come out carrying the prefix
+        exactly as the final save did and nothing ever repaired them. Measured
+        at 70B on 8xH100: 320 canonical keys in the output root, 320 prefixed
+        ones in ``checkpoint-100``.
+
+        Resuming is the case that decides how bad that is.
+        ``PeftModel.from_pretrained`` at least warns.
+        ``Trainer._load_from_checkpoint`` calls ``model.load_adapter(...)`` and
+        drops the return value, and ``load_adapter`` deliberately does not warn
+        (it returns the missing keys in the load result instead), while the
+        unexpected ``_orig_mod.`` keys are dropped by
+        ``load_state_dict(strict=False)``. So a resumed run silently continues
+        from a re-zeroed ``lora_B``, which is #335's failure with its one
+        warning removed.
+
+        Subclasses ``TrainerCallback`` so it inherits the no-op default for
+        every other event: HF's ``CallbackHandler.call_event`` dispatches via
+        ``getattr(cb, event)`` with no ``hasattr`` guard, so a duck-typed
+        callback survives wiring and then dies on ``on_epoch_begin`` (#308).
+        """
+
+        def __init__(self, output_dir: str = "", console: Any = None) -> None:
+            super().__init__()
+            # Fallback only: under real training the run directory comes from
+            # ``args.output_dir``. Mirrors HFPushCallback.
+            self.output_dir = output_dir
+            self.console = console
+
+        def on_save(self, args, state, control, **kwargs) -> None:
+            """Normalise the checkpoint ``_save_checkpoint`` has just written."""
+            # ``save_model`` writes the adapter only where ``args.should_save``
+            # is true, but this event is dispatched on every rank. Without the
+            # guard all 8 ranks of the run this was measured on would rewrite
+            # one file at once. Default True so a single-process run (and a
+            # test driving the callback directly) still does the work.
+            #
+            # ``args.should_save`` rather than ``state.is_world_process_zero``
+            # because it is the same condition that decided whether this rank
+            # wrote the file at all: ``TrainingArguments.should_save`` is
+            # ``local_process_index == 0`` under ``save_on_each_node`` and
+            # ``process_index == 0`` otherwise. Under ``save_on_each_node`` the
+            # two disagree, and every node but the first would then keep a
+            # checkpoint it had written and never repaired.
+            if not getattr(args, "should_save", True):
+                return
+            step = int(getattr(state, "global_step", 0) or 0)
+            if step <= 0:
+                return
+            output_dir = getattr(args, "output_dir", None) or self.output_dir
+            if not output_dir:
+                return
+
+            checkpoint = os.path.join(output_dir, f"checkpoint-{step}")
+            try:
+                renamed = strip_compile_prefix(checkpoint)
+            except Exception as exc:  # noqa: BLE001
+                # Never take a multi-hour run down over one checkpoint: the
+                # rewrite is atomic, so the prefixed file is still there and
+                # still holds the trained numbers. But say so loudly: the
+                # checkpoint that was left alone is a dead adapter, and a dead
+                # adapter nobody hears about is the entire defect.
+                message = (
+                    f"could not normalise {checkpoint}: {exc}. It keeps "
+                    "torch.compile's key prefix, so it will load as an adapter "
+                    "of zeros; the run directory's final save is unaffected."
+                )
+                logger.warning("CompilePrefixCallback: %s", message)
+                # escape: the path and the exception text are both interpolated,
+                # and an unescaped `[` in either would be eaten as Rich markup.
+                self._print(f"[yellow]{escape(message)}[/]")
+                return
+            if renamed:
+                self._print(
+                    f"[dim]Normalised {renamed} adapter keys in "
+                    f"checkpoint-{step} saved through torch.compile's wrapper[/]"
+                )
+
+        def _print(self, message: str) -> None:
+            if self.console is None:
+                return
+            try:
+                self.console.print(message)
+            except Exception:  # noqa: BLE001 (never crash on console issues)
+                pass
+
+    return CompilePrefixCallback
+
+
+def build_compile_prefix_callback(output_dir: str = "", console: Any = None) -> Any:
+    """Return a ``CompilePrefixCallback`` for ``output_dir``."""
+    callback_cls = _build_compile_prefix_callback_class()
+    return callback_cls(output_dir=output_dir, console=console)
+
+
+def attach_compile_prefix_callback(
+    trainer: Any,
+    tcfg: Any,
+    output_dir: str,
+    console: Any = None,
+) -> bool:
+    """Attach :class:`CompilePrefixCallback` when ``use_fsdp2_compile`` is set.
+
+    Returns ``True`` when attached, ``False`` otherwise. Gated on
+    ``use_fsdp2_compile`` alone, matching the final-save call site in
+    ``sft.py``: ``torch_compile`` is only really switched on when an FSDP config
+    is present too (see :func:`utils.fsdp.apply_fsdp_training_kwargs`), but
+    :func:`strip_compile_prefix` is a no-op on an adapter that has no prefix, so
+    the narrower condition would buy nothing and let the two gates drift.
+
+    Args:
+        trainer: HF Trainer (or duck-typed equivalent with ``add_callback``).
+        tcfg: ``KadhiConfig.training`` model.
+        output_dir: The run directory HF writes ``checkpoint-N`` under. Used
+            only if ``TrainingArguments.output_dir`` is missing at save time.
+        console: Optional Rich Console, for the same per-save note the final
+            save prints.
+    """
+    if not getattr(tcfg, "use_fsdp2_compile", False):
+        return False
+    trainer.add_callback(
+        build_compile_prefix_callback(output_dir=output_dir, console=console)
+    )
+    return True
