@@ -47,12 +47,32 @@ def test_module_imports():
 
 
 def test_no_heavy_deps_imported():
+    """Must run in a clean subprocess: other tests in this same file (the
+    real-checkpoint end-to-end tests) legitimately import numpy/safetensors
+    themselves, which would poison a same-process sys.modules check
+    regardless of plan.py's own imports — this proves plan.py's TOP-LEVEL
+    import graph specifically, independent of test execution order.
+    """
+    import subprocess
     import sys
 
-    from kadhi_cli.utils import plan  # noqa: F401
-
-    for heavy in ("torch", "numpy", "transformers", "peft", "safetensors"):
-        assert heavy not in sys.modules, f"{heavy} should not be imported by plan.py"
+    src_root = __import__("pathlib").Path(__file__).resolve().parents[1] / "src"
+    code = (
+        "import sys; "
+        "from kadhi_cli.utils import plan; "
+        "heavy = [m for m in ('torch', 'numpy', 'transformers', 'peft', 'safetensors') "
+        "if m in sys.modules]; "
+        "sys.exit(1) if heavy else sys.exit(0)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env={**__import__("os").environ, "PYTHONPATH": str(src_root)},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, (
+        f"plan.py's top-level import pulled in a heavy dependency "
+        f"(stdout={result.stdout!r}, stderr={result.stderr!r})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -409,3 +429,78 @@ def test_build_static_plan_raises_on_no_matching_target_modules(tmp_path):
             budget_params=100_000,
             default_r=8,
         )
+
+
+# ---------------------------------------------------------------------------
+# trainable_params_for_plan
+# ---------------------------------------------------------------------------
+
+def test_trainable_params_for_plan_uses_default_r_when_unmentioned():
+    from kadhi_cli.utils.plan import PlanResult, trainable_params_for_plan
+
+    shapes = [_shape("model.layers.0.q_proj", 100, 100)]
+    pr = PlanResult(rank_pattern={}, frozen_module_paths=(), default_r=8)
+    assert trainable_params_for_plan(shapes, pr) == 8 * 200
+
+
+def test_trainable_params_for_plan_uses_explicit_rank_when_present():
+    from kadhi_cli.utils.plan import PlanResult, trainable_params_for_plan
+
+    shapes = [_shape("model.layers.0.q_proj", 100, 100)]
+    pr = PlanResult(rank_pattern={"model.layers.0.q_proj": 16}, frozen_module_paths=(), default_r=8)
+    assert trainable_params_for_plan(shapes, pr) == 16 * 200
+
+
+def test_trainable_params_for_plan_frozen_layer_contributes_zero():
+    from kadhi_cli.utils.plan import PlanResult, trainable_params_for_plan
+
+    shapes = [_shape("model.layers.0.q_proj", 100, 100), _shape("model.layers.1.q_proj", 100, 100)]
+    pr = PlanResult(
+        rank_pattern={"model.layers.1.q_proj": 16},
+        frozen_module_paths=("model.layers.0.q_proj",),
+        default_r=8,
+    )
+    # Without the frozen distinction this would wrongly price layer 0 at
+    # default_r=8 instead of 0 — this is the exact pitfall the function's
+    # docstring documents (a direct-lookup analogue of what PEFT-style
+    # pattern re-matching would get wrong for the same reason).
+    assert trainable_params_for_plan(shapes, pr) == 0 + 16 * 200
+
+
+def test_trainable_params_for_plan_use_dora_adds_out_features():
+    from kadhi_cli.utils.plan import PlanResult, trainable_params_for_plan
+
+    shapes = [_shape("model.layers.0.q_proj", 100, 100)]
+    pr = PlanResult(rank_pattern={"model.layers.0.q_proj": 16}, frozen_module_paths=(), default_r=8)
+    without_dora = trainable_params_for_plan(shapes, pr, use_dora=False)
+    with_dora = trainable_params_for_plan(shapes, pr, use_dora=True)
+    assert with_dora == without_dora + 100  # + out_features
+
+
+def test_trainable_params_for_plan_matches_direct_hand_computation_from_a_real_allocation():
+    """Ties this function back to the real allocate_ranks pipeline: build a
+    real PlanResult via rank_pattern_from_allocation, then confirm
+    trainable_params_for_plan's total equals a hand-summed total over the
+    ORIGINAL allocation.ranks (the ground truth), proving the PlanResult
+    round-trip doesn't lose or double-count anything.
+    """
+    from kadhi_cli.utils.allocate import allocate_ranks
+    from kadhi_cli.utils.plan import (
+        cost_per_unit_rank_from_shapes,
+        rank_pattern_from_allocation,
+        trainable_params_for_plan,
+    )
+
+    shapes = [
+        _shape("model.layers.0.self_attn.q_proj", 100, 100),
+        _shape("model.layers.1.self_attn.q_proj", 100, 100),
+    ]
+    cost = cost_per_unit_rank_from_shapes(shapes)
+    scores = {"layer.0": 1.0, "layer.1": 5.0}
+    allocation = allocate_ranks(scores, cost, budget_params=3000, r_min=2, r_max=32)
+    plan_result = rank_pattern_from_allocation(shapes, allocation, default_r=8)
+
+    ground_truth = sum(
+        allocation.ranks[key] * cost[key] for key in allocation.ranks
+    )
+    assert trainable_params_for_plan(shapes, plan_result) == ground_truth

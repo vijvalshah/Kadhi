@@ -246,6 +246,41 @@ def rank_pattern_from_allocation(
     )
 
 
+def trainable_params_for_plan(
+    shapes: "Sequence[LoraModuleShape]", plan_result: PlanResult, *, use_dora: bool = False,
+) -> int:
+    """Exact trainable-parameter count implied by a :class:`PlanResult`.
+
+    Looks ``plan_result.rank_pattern`` up by DIRECT dict key against each
+    shape's exact ``name`` — never through
+    ``capacity.resolve_pattern_rank``'s PEFT-style suffix matching. That
+    distinction is load-bearing, not stylistic: PEFT's real matching
+    (``.*\\.{pattern}$``) requires a literal ``.`` immediately before the
+    matched pattern within the full parameter path — true in production,
+    where ``base_model.model.`` (or similar) always prefixes ``shape.name``
+    — but ``plan_result.rank_pattern``'s keys ARE ``shape.name`` verbatim, so
+    re-matching them against ``shape.name`` itself (no prefix) can never
+    succeed: there is no character before the start of a string. Routing
+    this function's accounting through that matcher would therefore silently
+    fall back to ``default_r`` for every module the allocator actually
+    changed. Since the mapping here is already known to be EXACT rather than
+    a fuzzy pattern, a direct lookup sidesteps the issue rather than working
+    around it.
+    """
+    frozen = set(plan_result.frozen_module_paths)
+    total = 0
+    for shape in shapes:
+        if shape.name in frozen:
+            continue
+        rank = plan_result.rank_pattern.get(shape.name, plan_result.default_r)
+        if rank <= 0:
+            continue
+        total += rank * (shape.in_features + shape.out_features)
+        if use_dora:
+            total += shape.out_features
+    return total
+
+
 def aggregate_layer_snr(layer_snrs: "Sequence[LayerSNR]") -> "dict[str, float]":
     """Average per-matrix spectral SNR into a per-layer score.
 
