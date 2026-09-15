@@ -237,28 +237,69 @@ project pivots to the resource-model contribution alone.
 
 ### Phase 3 — Sensitivity probe and allocator
 
+**Status: every component built and tested except the feasibility loop and the
+CLI surface. The full pipeline runs today in a STATIC mode (no gradient probe,
+no live model, no dataset) and produces a real `rank_pattern` from real
+spectral math on a real checkpoint — verified, not asserted, in
+`tests/test_plan.py`.**
+
 **Build**
 - `utils/sensitivity.py` — short warmup probe, `|∂L/∂W ⊙ W|` per layer, normalised by
   parameter count, cached per (model, dataset) pair in the manner of existing scan
-  caches.
+  caches. **Built and tested** (30 tests pass torch-free; 4 torch-dependent
+  numerical tests skip via `pytest.importorskip` in an environment where torch
+  itself is unavailable, rather than being run and passing on real gradients —
+  that verification is still owed).
 - `utils/allocate.py` — concave-objective allocation by bisection on the marginal
-  utility, clamped to admissible ranks, rounded, emitting `rank_pattern`.
+  utility, clamped to admissible ranks, rounded, emitting an opaque per-layer
+  `ranks` mapping (not `rank_pattern` directly — see below). **Built and
+  tested** (32 tests, including a hand-verified closed-form check against the
+  converged Lagrange multiplier).
+- `utils/plan.py` — the bridge `allocate.py` was deliberately agnostic about:
+  groups `capacity.py`'s per-module shapes by decoder layer, derives
+  `allocate_ranks`' per-layer cost from them, and expands an allocation's
+  per-layer ranks into a real, PEFT-shaped `rank_pattern` (one entry per
+  module, omitting entries equal to the default rank). Also
+  `build_static_plan`, which composes capacity + `spectrum_scan`'s existing
+  spectral SNR (no gradient probe needed — SNR is already static and
+  torch-free) + `allocate.py` into one call that goes from an on-disk
+  checkpoint straight to a `rank_pattern`. **Built and tested end to end
+  against a real safetensors checkpoint with real float32 data** (not a
+  zero-byte fixture): one layer built as a low-rank matrix, one as pure
+  noise, and the real SVD-based SNR correctly ranks the structured layer
+  higher. This was not part of the original plan — it fell out of
+  discovering, while wiring the pieces together, that PEFT's `rank_pattern`
+  needs a per-module expansion `allocate_ranks` was never going to produce on
+  its own, and that a working controller does not require a gradient probe.
 - Feasibility loop: allocate, check against the phase-1 resource model, reduce the
-  budget and re-allocate on rejection.
-- `controller:` configuration block and a `kadhi plan --explain` surface that prints the
-  ranking, the pattern, the VRAM breakdown, and the noise floor.
+  budget and re-allocate on rejection. **Not built.** `build_static_plan` does
+  not yet call `hardware_fit`; a plan can be produced that the resource model
+  would refuse, and nothing today closes that loop.
+- `controller:` configuration block. **Built** (schema-only, mirroring the
+  `AdviseConfig` precedent exactly) — validated, tested, and its example YAML
+  in `adaptation-controller.md` §4 round-trips through the real schema.
+- `kadhi allocate --explain` CLI surface. **Not built.** Note the rename from
+  the earlier `kadhi plan` — that name is already a shipped, unrelated
+  command (a Terraform-shape cost/VRAM/drift pre-flight summary); this was
+  caught while starting the CLI wiring, before it became a real collision.
 - Correlation report between the probe and the two static layer signals.
+  `sensitivity.correlate_with_static_signals` exists and is tested; nothing
+  yet calls it from a live run, since that requires the gradient probe to
+  have actually run once (see above).
 
 **Done when**
 - The controller emits a valid `rank_pattern` that trains without intervention.
+  Partially true: `build_static_plan` emits one today; it has not yet been
+  fed into an actual training run.
 - At equal trainable-parameter count, allocated rank beats uniform rank on held-out
   quality by more than the phase-2 noise floor, on at least two model/dataset pairs.
+  Not yet measured — blocked on phase 2's noise floor, which is itself unrun.
 - Total wall-clock including probe and planning is reported honestly against the
-  baselines, whether or not it wins.
+  baselines, whether or not it wins. Not yet measured.
 
 **Fails if** allocation does not beat uniform rank beyond the noise floor. That is a
 publishable negative result given how much of the literature assumes otherwise, and it
-is reported as one rather than tuned around.
+is reported as one rather than tuned around. Not yet determined.
 
 ### Phase 4 — Growth and frontier reporting *(stretch)*
 

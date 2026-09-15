@@ -143,7 +143,7 @@ controller:
 ```
 
 ```bash
-kadhi plan --config kadhi.yaml --explain   # sensitivity ranking, rank pattern, VRAM breakdown
+kadhi allocate --config kadhi.yaml --explain   # sensitivity ranking, rank pattern, VRAM breakdown
 ```
 
 Work is split into four independently shippable phases:
@@ -152,7 +152,7 @@ Work is split into four independently shippable phases:
 |---|---|---|
 | 1 | Exact LoRA capacity accounting; peak-VRAM predictor validated against measurement | Capacity accounting + predictor wiring built and tested; hardware validation run pending |
 | 2 | Seed-variance harness; noise floor and baseline numbers | Harness built; run on real hardware pending |
-| 3 | Layer sensitivity probe; capacity allocator emitting `lora.rank_pattern`; `kadhi plan` | Open |
+| 3 | Layer sensitivity probe; capacity allocator emitting `lora.rank_pattern`; `kadhi allocate` | Probe, allocator, and a real static end-to-end pipeline built and tested; feasibility loop + CLI command pending |
 | 4 | In-place rank growth; frontier reporting | Stretch |
 
 **Contributing:** [adaptation-controller.md](docs/adaptation-controller.md) is the

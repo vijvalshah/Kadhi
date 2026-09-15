@@ -236,14 +236,14 @@ for base-model comparison, so plans and candidates are readable by the same tool
 
 ```yaml
 # kadhi.yaml
-model: meta-llama/Llama-3.1-8B
+base: meta-llama/Llama-3.1-8B
 
 controller:
   enabled: true
   budget:
-    trainable_params: 8M      # optional; inferred from vram when omitted
-    wall_clock: 4h            # optional
-    vram: 4GB                 # hard feasibility ceiling
+    trainable_params: 8000000   # at least one of trainable_params / vram_gb is required
+    wall_clock_seconds: 14400   # optional
+    vram_gb: 4.0                # hard feasibility ceiling
   probe:
     steps: 50
     corroborate: [spectrum, shrink]   # report rank correlation
@@ -252,15 +252,25 @@ controller:
     max_stages: 3
 ```
 
+(Field types are plain numeric — an int parameter count, a float GB figure, an
+int seconds duration — matching every other budget-shaped field elsewhere in
+`kadhi.yaml`, rather than a human-readable suffix string like `"8M"` or
+`"4GB"`; no such parser exists anywhere else in this schema, so this block
+doesn't invent one just for itself. This YAML is real: `controller:` is a
+validated part of the schema today — see `ControllerConfig` in
+`config/schema.py` — though nothing yet reads it, since `kadhi allocate`
+below does not exist as a CLI command yet either. See
+`adaptation-controller-plan.md` for exactly what is built versus proposed.)
+
 ```bash
 # produce a plan without training
-kadhi plan --config kadhi.yaml --explain
+kadhi allocate --config kadhi.yaml --explain
 
 # plan and train in one pass
 kadhi train --config kadhi.yaml
 ```
 
-`kadhi plan --explain` prints the sensitivity ranking, the resulting rank pattern, the
+`kadhi allocate --explain` prints the sensitivity ranking, the resulting rank pattern, the
 VRAM breakdown against the ceiling, and the noise floor that will govern stopping.
 The emitted `lora.rank_pattern` is an ordinary configuration field — a plan can be
 inspected, edited, committed, and re-run without the controller in the loop.
