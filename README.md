@@ -150,8 +150,8 @@ Work is split into four independently shippable phases:
 
 | Phase | Scope | State |
 |---|---|---|
-| 1 | Exact LoRA capacity accounting; peak-VRAM predictor validated against measurement | Open |
-| 2 | Seed-variance harness; noise floor and baseline numbers | Open |
+| 1 | Exact LoRA capacity accounting; peak-VRAM predictor validated against measurement | Capacity accounting + predictor wiring built and tested; hardware validation run pending |
+| 2 | Seed-variance harness; noise floor and baseline numbers | Harness built; run on real hardware pending |
 | 3 | Layer sensitivity probe; capacity allocator emitting `lora.rank_pattern`; `kadhi plan` | Open |
 | 4 | In-place rank growth; frontier reporting | Stretch |
 

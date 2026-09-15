@@ -14,7 +14,11 @@ The math is intentionally conservative — operators can supply
 Public surface:
 - ``VRAM_SAFETY_MARGIN = 0.10``.
 - ``validate_seq_len(v)`` / ``validate_batch_size(v)``.
-- ``HardwareFitInput`` frozen dataclass.
+- ``HardwareFitInput`` frozen dataclass. Its optional ``trainable_params``
+  field lets a caller supply an exact trainable-parameter count (e.g. from
+  ``utils/capacity.py``'s rank-aware accounting) instead of the flat
+  1%-of-params LoRA heuristic; ``None`` (the default) preserves the
+  original constant-fraction behavior byte-for-byte.
 - ``VRAMBreakdown`` frozen dataclass + ``total_gb`` property.
 - ``HardwareFitReport`` frozen dataclass.
 - ``estimate_peak_vram_gb(inp)`` -> ``VRAMBreakdown``.
@@ -25,6 +29,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 VRAM_SAFETY_MARGIN = 0.10  # 10% headroom
 
@@ -81,6 +86,7 @@ class HardwareFitInput:
     quant: str
     peft: str
     gradient_checkpointing: bool
+    trainable_params: Optional[int] = None
 
     def __post_init__(self) -> None:
         if isinstance(self.params_b, bool):
@@ -120,6 +126,21 @@ class HardwareFitInput:
             )
         if not isinstance(self.gradient_checkpointing, bool):
             raise TypeError("gradient_checkpointing must be bool")
+        if self.trainable_params is not None:
+            if isinstance(self.trainable_params, bool):
+                raise TypeError(
+                    "trainable_params must be int or None, not bool"
+                )
+            if not isinstance(self.trainable_params, int):
+                raise TypeError(
+                    "trainable_params must be int or None, got "
+                    f"{type(self.trainable_params).__name__}"
+                )
+            if self.trainable_params < 0:
+                raise ValueError(
+                    "trainable_params must not be negative, got "
+                    f"{self.trainable_params}"
+                )
 
 
 @dataclass(frozen=True)
@@ -219,7 +240,17 @@ _OPTIM_BYTES_PER_PARAM = {
 
 
 def _trainable_param_fraction(peft: str) -> float:
-    """LoRA / DoRA / QLoRA train ~1% of parameters. Full = 100%."""
+    """LoRA / DoRA / QLoRA train ~1% of parameters. Full = 100%.
+
+    This is now the *fallback* path only: it fires when
+    ``HardwareFitInput.trainable_params`` is ``None``, i.e. exact rank-aware
+    accounting (``utils/capacity.py``) wasn't available — typically because
+    the base model checkpoint isn't local yet at pre-flight time. It is
+    rank-blind and roughly an order of magnitude over-cautious versus a
+    realistic rank-16 q/v pattern on an 8B model (see
+    ``docs/adaptation-controller-plan.md`` §1.1), so callers should prefer
+    supplying an exact count whenever one is available.
+    """
     if peft == "full":
         return 1.0
     if peft in ("lora", "qlora", "dora"):
@@ -266,8 +297,14 @@ def estimate_peak_vram_gb(inp: HardwareFitInput) -> VRAMBreakdown:
         bytes_per = 4.0
     weights_b = params * bytes_per
 
-    trainable_frac = _trainable_param_fraction(inp.peft)
-    trainable_params = params * trainable_frac
+    if inp.trainable_params is not None:
+        # Exact, rank-aware count supplied by the caller (e.g. from
+        # ``utils/capacity.py``) — use it directly instead of the flat
+        # 1%-of-params LoRA heuristic.
+        trainable_params = float(inp.trainable_params)
+    else:
+        trainable_frac = _trainable_param_fraction(inp.peft)
+        trainable_params = params * trainable_frac
     optim_b = trainable_params * _OPTIM_BYTES_PER_PARAM.get(inp.optimizer, 8.0)
     # Gradients are fp32 of trainable params (4 bytes/param) under
     # mixed-precision; under "none" quant we still keep fp32 grads.
