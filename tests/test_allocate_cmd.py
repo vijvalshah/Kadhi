@@ -1,7 +1,7 @@
 """Tests for `kadhi allocate` (commands/allocate.py) — end to end via the
 real Typer CLI app against a real synthetic checkpoint. No mocking: this
 exercises config loading, the local-checkpoint check, capacity.py's shape
-discovery, spectrum_scan's real SVD-based SNR, allocate.py's real bisection,
+discovery, spectrum_scan's real SVD-based SNR, allocate.py's real greedy allocator,
 and hardware_fit's real VRAM predictor, all through the actual `kadhi
 allocate` command a user would run.
 """
@@ -95,6 +95,24 @@ def test_allocate_cmd_infeasible_exits_nonzero(tmp_path, monkeypatch):
     result = runner.invoke(app, ["allocate", "--config", str(cfg_path)])
     assert result.exit_code == 3, result.output
     assert "not feasible" in result.output.lower()
+
+
+def test_allocate_cmd_reports_infeasible_at_any_rank_distinctly(tmp_path, monkeypatch):
+    """When even a fully-frozen allocation cannot fit, the overflow is base
+    weights/activations/overhead — not the adapter. Saying only "not feasible"
+    would send the operator off to tune a budget that was never the problem,
+    so that case gets its own actionable message."""
+    monkeypatch.chdir(tmp_path)
+    _write_checkpoint(tmp_path)
+    cfg_path = _write_config(tmp_path, vram_gb=0.001)
+
+    result = runner.invoke(app, ["allocate", "--config", str(cfg_path)])
+    assert result.exit_code == 3, result.output
+    assert "Not feasible at ANY rank" in result.output
+    assert "0 trainable" in result.output
+    # It must name a lever that actually helps, and rule out the one that doesn't.
+    assert "gradient_checkpointing" in result.output
+    assert "Raising the parameter budget cannot help" in result.output
 
 
 def test_allocate_cmd_requires_controller_enabled(tmp_path, monkeypatch):

@@ -53,8 +53,14 @@ Public surface:
 - ``aggregate_layer_snr(layer_snrs)`` -> dict[str, float].
 - ``PlanResult`` frozen dataclass.
 - ``rank_pattern_from_allocation(shapes, allocation, *, default_r)`` -> PlanResult.
+- ``LayerSignals`` frozen dataclass — the expensive measurement, done once.
+- ``compute_layer_signals(weights_dir, target_modules, *, modules="all")``
+  -> LayerSignals (EXPENSIVE: the only step that touches model weights).
+- ``plan_from_signals(signals, *, budget_params, default_r, r_min=4,
+  r_max=64)`` -> PlanResult (cheap; safe to call in a loop).
 - ``build_static_plan(weights_dir, target_modules, *, budget_params,
-  default_r, r_min=4, r_max=64, modules="all")`` -> PlanResult.
+  default_r, r_min=4, r_max=64, modules="all")`` -> PlanResult — a thin
+  wrapper over the two above, for one-shot callers only.
 """
 
 from __future__ import annotations
@@ -282,31 +288,326 @@ def trainable_params_for_plan(
 
 
 def aggregate_layer_snr(layer_snrs: "Sequence[LayerSNR]") -> "dict[str, float]":
-    """Average per-matrix spectral SNR into a per-layer score.
+    """Scale-corrected per-layer score from per-matrix spectral SNR.
 
     ``spectrum_scan.scan_weights_dir`` returns one :class:`LayerSNR` per
-    weight MATRIX; the allocator needs one score per LAYER. This averages
-    every matrix's ``snr`` that belongs to the same decoder layer (same
-    ``layer_key`` convention as the rest of this module), so the result is
-    directly usable as ``allocate_ranks``' ``scores`` argument.
+    weight MATRIX; the allocator needs one score per LAYER. Averaging the raw
+    ``snr`` values of a layer's matrices — what this function used to do — is
+    statistically invalid, because spectral SNR magnitude depends on the
+    matrix SHAPE, not only on how informative the layer is. Measured on an
+    IDENTICAL generative process (same low-rank signal + same noise), varying
+    only the shape:
 
-    A matrix whose name carries no ``layers.N.`` / ``h.N.`` segment is
-    skipped (mirrors ``group_shapes_by_layer``). Raises ValueError if nothing
-    aggregates.
+    ===============  ============  ==================
+    matrix           shape         SNR
+    ===============  ============  ==================
+    square           512x512       ~0.0060
+    wide             1376x512      ~0.0411  (~7x)
+    tall             512x1376      ~0.0402  (~7x)
+    ===============  ============  ==================
+
+    So in a Llama-style model the rectangular MLP matrices (gate/up/down)
+    systematically dominate the square-ish attention matrices (q/o) by ~7x in
+    a plain mean, and a layer's score ends up reflecting almost purely its
+    MLP SNR — regardless of actual importance.
+
+    The fix, following the precedent already established by
+    ``spectrum_scan.select_unfrozen_parameters`` (which groups by
+    :func:`spectrum_scan.layer_type_signature` and selects WITHIN each
+    module-type group precisely so the choice "keeps the unfreeze balanced
+    across module types"): normalize each matrix's SNR **within its
+    ``layer_type_signature`` group, across layers**, before averaging the —
+    now comparable — values per layer::
+
+        normalized(m)  =  snr(m) / mean{ snr(m') : group(m') == group(m) }
+        score(layer)   =  mean{ normalized(m) : m in layer }
+
+    Mean-normalization specifically (not a z-score, not rank-normalization):
+
+    - It is **scale-correcting**: every module-type group ends up with mean
+      1.0, so each module type contributes equally to a layer's score.
+    - It **preserves within-group RATIOS**, which is where the actual signal
+      lives — a layer 2x better than its peers at ``q_proj`` stays 2x better.
+      Rank-normalization would throw that magnitude information away.
+    - It keeps every value **strictly positive**, which
+      ``allocate.allocate_ranks`` REQUIRES (it raises ``ValueError`` on a
+      non-positive score). A z-score would produce negative values for every
+      below-average layer and break that contract outright.
+
+    Skipping rules (all deliberate, none silent-but-wrong):
+
+    - A matrix whose name carries no ``layers.N.`` / ``h.N.`` segment is
+      skipped (mirrors :func:`group_shapes_by_layer`).
+    - An individual non-finite ``snr`` is skipped.
+    - A whole group whose mean SNR is 0 or non-finite is skipped — dividing
+      by it would emit zeros/NaNs that later trip ``allocate_ranks``'
+      positivity check with a confusing, far-away error.
+    - A layer left with NO contributing matrices after that skipping is
+      OMITTED from the result entirely, rather than emitted as a 0.0 score
+      that ``allocate_ranks`` would reject.
+
+    Raises ``ValueError`` if nothing aggregates at all. Every returned score
+    is guaranteed finite and > 0.
     """
-    grouped: dict[str, list[float]] = {}
+    import math
+
+    from kadhi_cli.utils.spectrum_scan import layer_type_signature
+
+    # (layer_key, group, snr) for every usable record.
+    usable: list[tuple[str, str, float]] = []
+    group_sums: dict[str, float] = {}
+    group_counts: dict[str, int] = {}
     for record in layer_snrs:
         match = _LAYER_RE.search(record.name)
         if match is None:
             continue
+        snr = float(record.snr)
+        if not math.isfinite(snr):
+            continue
         key = layer_key(int(match.group(1)))
-        grouped.setdefault(key, []).append(float(record.snr))
-    if not grouped:
+        group = layer_type_signature(record.name)
+        usable.append((key, group, snr))
+        group_sums[group] = group_sums.get(group, 0.0) + snr
+        group_counts[group] = group_counts.get(group, 0) + 1
+
+    if not usable:
         raise ValueError(
             "aggregate_layer_snr: no LayerSNR name contains a 'layers.N.' / "
             "'h.N.' segment — nothing to score."
         )
-    return {key: sum(values) / len(values) for key, values in grouped.items()}
+
+    group_means = {
+        group: group_sums[group] / group_counts[group] for group in group_sums
+    }
+
+    normalized: dict[str, list[float]] = {}
+    for key, group, snr in usable:
+        mean = group_means[group]
+        if not math.isfinite(mean) or mean <= 0.0:
+            continue  # whole group skipped — see docstring
+        normalized.setdefault(key, []).append(snr / mean)
+
+    if not normalized:
+        raise ValueError(
+            "aggregate_layer_snr: every module-type group had a zero or "
+            "non-finite mean SNR — nothing to score."
+        )
+
+    scores = {key: sum(values) / len(values) for key, values in normalized.items()}
+
+    # Guard the contract allocate_ranks depends on, here rather than three
+    # calls away where the error would be unintelligible.
+    for key, value in scores.items():
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                f"aggregate_layer_snr: computed a non-positive/non-finite "
+                f"score for {key!r} ({value!r}) — allocate_ranks requires "
+                "every score to be finite and > 0."
+            )
+    return scores
+
+
+@dataclass(frozen=True)
+class LayerSignals:
+    """Everything expensive about planning, measured ONCE and reusable.
+
+    Producing a plan has two halves with wildly different costs: MEASURING
+    the model (a full SVD of every weight matrix — minutes on a real 8B) and
+    ALLOCATING under a budget (microseconds of arithmetic). This dataclass is
+    the boundary between them: it holds the measured half, so a caller that
+    plans repeatedly — most importantly ``feasibility.fit_plan_to_budget``,
+    which re-plans once per budget-shrink iteration — measures once and
+    allocates many times.
+
+    - ``shapes``: the LoRA-eligible module shapes, already restricted to the
+      layers both the SNR scan and the shape discovery agree exist.
+    - ``scores``: ``layer_key`` -> normalized per-layer score (see
+      :func:`aggregate_layer_snr`), all finite and > 0 as
+      ``allocate.allocate_ranks`` requires.
+    - ``cost_per_unit_rank``: ``layer_key`` -> trainable params per unit of
+      rank, all positive ints.
+
+    ``scores`` and ``cost_per_unit_rank`` are required to have IDENTICAL key
+    sets, so an instance is internally consistent by construction and
+    :func:`plan_from_signals` needs no reconciliation of its own.
+    """
+
+    shapes: "tuple[LoraModuleShape, ...]"
+    scores: "Mapping[str, float]"
+    cost_per_unit_rank: "Mapping[str, int]"
+
+    def __post_init__(self) -> None:
+        import math
+
+        if not isinstance(self.shapes, tuple):
+            raise TypeError(f"shapes must be a tuple, got {type(self.shapes).__name__}")
+        if not self.shapes:
+            raise ValueError("shapes must not be empty")
+        for field_name in ("scores", "cost_per_unit_rank"):
+            value = getattr(self, field_name)
+            if not isinstance(value, Mapping):
+                raise TypeError(
+                    f"{field_name} must be a Mapping, got {type(value).__name__}"
+                )
+            if not value:
+                raise ValueError(f"{field_name} must not be empty")
+            for key in value:
+                if not isinstance(key, str):
+                    raise TypeError(
+                        f"{field_name} keys must be str, got {type(key).__name__}"
+                    )
+        score_keys = set(self.scores)
+        cost_keys = set(self.cost_per_unit_rank)
+        if score_keys != cost_keys:
+            raise ValueError(
+                "LayerSignals: scores and cost_per_unit_rank must have "
+                "identical key sets — "
+                f"scored but uncosted: {sorted(score_keys - cost_keys)}; "
+                f"costed but unscored: {sorted(cost_keys - score_keys)}"
+            )
+        for key, score in self.scores.items():
+            if isinstance(score, bool):
+                raise TypeError(f"scores[{key!r}] must be a float, not bool")
+            if not isinstance(score, (int, float)):
+                raise TypeError(
+                    f"scores[{key!r}] must be a number, got {type(score).__name__}"
+                )
+            if not math.isfinite(float(score)) or float(score) <= 0.0:
+                raise ValueError(
+                    f"scores[{key!r}] must be finite and > 0, got {score!r} "
+                    "(allocate_ranks rejects non-positive scores; omit the "
+                    "layer instead of scoring it 0)"
+                )
+        for key, cost in self.cost_per_unit_rank.items():
+            if isinstance(cost, bool):
+                raise TypeError(f"cost_per_unit_rank[{key!r}] must be int, not bool")
+            if not isinstance(cost, int):
+                raise TypeError(
+                    f"cost_per_unit_rank[{key!r}] must be int, got "
+                    f"{type(cost).__name__}"
+                )
+            if cost <= 0:
+                raise ValueError(
+                    f"cost_per_unit_rank[{key!r}] must be > 0, got {cost}"
+                )
+
+
+def compute_layer_signals(
+    weights_dir: str,
+    target_modules: "str | Sequence[str]",
+    *,
+    modules: str = "all",
+) -> LayerSignals:
+    """Run the expensive measurement once: discover shapes, scan spectral
+    SNR, normalize + aggregate to per-layer scores, derive per-layer cost.
+
+    This is the ONLY part of planning that touches the model's weights (a
+    full SVD per matrix). Call it once and reuse the result across as many
+    allocations as you like via :func:`plan_from_signals`.
+
+    Steps:
+
+    1. ``capacity.discover_lora_module_shapes`` — real per-module shapes.
+    2. ``spectrum_scan.scan_weights_dir`` — real spectral SNR per matrix
+       (the STATIC, task-independent signal; see this module's docstring for
+       why the gradient probe is a better-but-optional upgrade, not a
+       prerequisite).
+    3. :func:`aggregate_layer_snr` — scale-corrected per-layer score.
+    4. :func:`cost_per_unit_rank_from_shapes` — per-layer cost.
+    5. Reconciliation: the SNR scan and the shape discovery can disagree on
+       which layers exist (different module filters), so everything is
+       restricted to their intersection here — which is what makes the
+       returned :class:`LayerSignals` internally consistent by construction.
+
+    Raises whatever the underlying step raises (a checkpoint with no matching
+    target modules, an unindexed architecture) — no extra error handling is
+    layered on top, since a caller needs to see exactly which step failed.
+    """
+    from kadhi_cli.utils.capacity import discover_lora_module_shapes
+    from kadhi_cli.utils.spectrum_scan import scan_weights_dir
+
+    shapes = discover_lora_module_shapes(weights_dir, target_modules)
+    if not shapes:
+        raise ValueError(
+            f"compute_layer_signals: no matching LoRA-eligible weights found "
+            f"under {weights_dir!r} for target_modules={target_modules!r}"
+        )
+
+    # NOTE on spectrum_scan's on-disk scan cache (read_cached_scan /
+    # write_cached_scan / scan_model): deliberately NOT wired in here.
+    # Those entry points key the cache on a MODEL IDENTITY
+    # (``model_slug(model)``, truncated to 128 chars) with no content
+    # fingerprint — no shard size, mtime or digest — whereas this function is
+    # handed a weights DIRECTORY. Kadhi materializes a given model into one
+    # fixed cache directory, so re-fetching or updating a checkpoint leaves
+    # the path unchanged while the weights change, and a cache hit would then
+    # return SNRs measured from different weights, silently; two long
+    # directory paths sharing a 128-char prefix additionally slug-collide.
+    # The `modules` filter IS part of the cache key (read_cached_scan rejects
+    # a mismatch), so that half is fine — what is missing is a weights
+    # fingerprint. Wiring the cache safely needs a content-addressed key
+    # (e.g. the ``_weight_file_manifest`` tuple folded into the slug); until
+    # then a slow scan beats a wrong one. The severe cost this function's
+    # existence fixes — re-scanning once per feasibility iteration — is
+    # already eliminated by hoisting the scan out of the loop entirely.
+    layer_snrs = scan_weights_dir(weights_dir, modules=modules)
+    scores = aggregate_layer_snr(layer_snrs)
+    cost = cost_per_unit_rank_from_shapes(shapes)
+
+    common = set(scores) & set(cost)
+    if not common:
+        raise ValueError(
+            "compute_layer_signals: the SNR scan and the LoRA module "
+            "discovery share no layer in common — check `modules` vs "
+            "`target_modules`."
+        )
+    scores = {k: v for k, v in scores.items() if k in common}
+    cost = {k: v for k, v in cost.items() if k in common}
+    # Restrict shapes to layers present in `common` so rank_pattern_from_
+    # allocation's shapes/allocation key-set check passes even when a filter
+    # mismatch dropped some layers above.
+    shapes = tuple(
+        s for s in shapes
+        if (m := _LAYER_RE.search(s.name)) is not None and layer_key(int(m.group(1))) in common
+    )
+
+    return LayerSignals(shapes=shapes, scores=scores, cost_per_unit_rank=cost)
+
+
+def plan_from_signals(
+    signals: LayerSignals,
+    *,
+    budget_params: int,
+    default_r: int,
+    r_min: int = 4,
+    r_max: int = 64,
+) -> PlanResult:
+    """Cheap: allocate under a budget from already-computed signals.
+
+    Does NO model I/O — no SVD, no safetensors read — so it is safe to call
+    many times, which is exactly what ``feasibility.fit_plan_to_budget``'s
+    shrink loop needs. Composes ``allocate.allocate_ranks`` with
+    :func:`rank_pattern_from_allocation`.
+
+    ``signals`` is already internally consistent (see :class:`LayerSignals`),
+    so no reconciliation happens here.
+    """
+    from kadhi_cli.utils.allocate import allocate_ranks
+
+    if not isinstance(signals, LayerSignals):
+        raise TypeError(
+            f"signals must be a LayerSignals, got {type(signals).__name__}"
+        )
+    allocation = allocate_ranks(
+        signals.scores,
+        signals.cost_per_unit_rank,
+        budget_params=budget_params,
+        r_min=r_min,
+        r_max=r_max,
+    )
+    return rank_pattern_from_allocation(
+        signals.shapes, allocation, default_r=default_r
+    )
 
 
 def build_static_plan(
@@ -321,7 +622,8 @@ def build_static_plan(
 ) -> PlanResult:
     """Produce a real ``rank_pattern`` from an on-disk checkpoint alone.
 
-    Composes, in order:
+    A thin convenience wrapper: :func:`compute_layer_signals` followed by
+    :func:`plan_from_signals`. Composes, in order:
 
     1. ``capacity.discover_lora_module_shapes`` — real per-module shapes.
     2. ``spectrum_scan.scan_weights_dir`` — real spectral SNR per matrix
@@ -339,42 +641,20 @@ def build_static_plan(
     matching target modules, an unindexed architecture, an unreachable
     budget) — this function does not add its own error handling on top,
     since a caller needs to see exactly which step failed and why.
+
+    **Do not call this in a loop.** Steps 1-2 are the expensive ones (a full
+    SVD of every weight matrix — minutes on a real 8B), and this function
+    re-runs them on EVERY call, so a caller that plans repeatedly under
+    different budgets — ``feasibility.fit_plan_to_budget``'s shrink loop
+    being the one that matters — re-does the entire scan per iteration. Use
+    the two-step API instead: call :func:`compute_layer_signals` once, then
+    :func:`plan_from_signals` per budget.
     """
-    from kadhi_cli.utils.allocate import allocate_ranks
-    from kadhi_cli.utils.capacity import discover_lora_module_shapes
-    from kadhi_cli.utils.spectrum_scan import scan_weights_dir
-
-    shapes = discover_lora_module_shapes(weights_dir, target_modules)
-    if not shapes:
-        raise ValueError(
-            f"build_static_plan: no matching LoRA-eligible weights found "
-            f"under {weights_dir!r} for target_modules={target_modules!r}"
-        )
-    layer_snrs = scan_weights_dir(weights_dir, modules=modules)
-    scores = aggregate_layer_snr(layer_snrs)
-    cost = cost_per_unit_rank_from_shapes(shapes)
-
-    # scan_weights_dir and discover_lora_module_shapes can disagree on which
-    # layers they see (different module filters) — restrict to the
-    # intersection rather than letting allocate_ranks reject the mismatch,
-    # since a partial static signal is still useful for the layers it covers.
-    common = set(scores) & set(cost)
-    if not common:
-        raise ValueError(
-            "build_static_plan: the SNR scan and the LoRA module discovery "
-            "share no layer in common — check `modules` vs `target_modules`."
-        )
-    scores = {k: v for k, v in scores.items() if k in common}
-    cost = {k: v for k, v in cost.items() if k in common}
-    # Restrict shapes to layers present in `common` so rank_pattern_from_
-    # allocation's shapes/allocation key-set check passes even when a filter
-    # mismatch dropped some layers above.
-    shapes = tuple(
-        s for s in shapes
-        if (m := _LAYER_RE.search(s.name)) is not None and layer_key(int(m.group(1))) in common
+    signals = compute_layer_signals(weights_dir, target_modules, modules=modules)
+    return plan_from_signals(
+        signals,
+        budget_params=budget_params,
+        default_r=default_r,
+        r_min=r_min,
+        r_max=r_max,
     )
-
-    allocation = allocate_ranks(
-        scores, cost, budget_params=budget_params, r_min=r_min, r_max=r_max,
-    )
-    return rank_pattern_from_allocation(shapes, allocation, default_r=default_r)

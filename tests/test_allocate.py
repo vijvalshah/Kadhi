@@ -348,46 +348,124 @@ def test_allocate_ranks_hand_computable_two_layer_case():
     costs = {"a": 1000, "b": 1000}
     budget = 50_000
 
-    result = allocate_ranks(
-        scores, costs, budget_params=budget, r_min=1, r_max=1000, tolerance=1e-9
-    )
+    result = allocate_ranks(scores, costs, budget_params=budget, r_min=1, r_max=1000)
 
+    # Higher score at equal cost must get strictly more rank.
     assert result.ranks["a"] > result.ranks["b"]
-
-    lam = result.lambda_star
-    for key in ("a", "b"):
-        continuous = max(0.0, scores[key] / (lam * costs[key]) - 1.0)
-        # The final integer rank should be within a small rounding-scale
-        # distance of the continuous closed-form value at lambda_star.
-        assert abs(continuous - result.ranks[key]) < 1.0 + 1e-3
+    # Greedy spends the budget down: with equal costs of 1000 and a 50,000
+    # budget, exactly 50 units of rank are affordable in total.
+    assert result.ranks["a"] + result.ranks["b"] == 50
+    assert result.used_params == budget
 
 
 # ---------------------------------------------------------------------------
-# iterations bookkeeping
+# Guarantees of the greedy marginal allocator
 # ---------------------------------------------------------------------------
 
 
-def test_allocate_ranks_iterations_never_exceeds_max_iters():
+def test_allocate_ranks_never_exceeds_budget():
+    """The previous continuous-relaxation allocator could overshoot once
+    several layers clamped to r_max. Greedy cannot, by construction."""
+    import random
+
+    from kadhi_cli.utils.allocate import allocate_ranks
+
+    rng = random.Random(4)
+    for _ in range(200):
+        n = rng.choice([2, 5, 16])
+        scores = {f"l{i}": round(rng.uniform(0.05, 3.0), 4) for i in range(n)}
+        costs = {f"l{i}": rng.choice([500, 8192, 81920]) for i in range(n)}
+        budget = rng.randint(1_000, 5_000_000)
+        result = allocate_ranks(scores, costs, budget_params=budget, r_min=4, r_max=64)
+        assert result.used_params <= budget
+        assert result.over_budget is False
+
+
+def test_allocate_ranks_spends_budget_it_can_afford():
+    """Regression guard for the defect that motivated the rewrite: the old
+    allocator froze every layer whose continuous rank landed just under
+    r_min and never redistributed their share, in one measured case
+    committing only 65,536 of 551,241 available parameters (12%)."""
+    from kadhi_cli.utils.allocate import allocate_ranks
+
+    scores = {f"l{i}": 1.0 + i * 0.01 for i in range(16)}
+    costs = {f"l{i}": 8192 for i in range(16)}
+    budget = 600_000
+    result = allocate_ranks(scores, costs, budget_params=budget, r_min=4, r_max=64)
+
+    # Whatever is left over must be too small to buy even one more unit at
+    # the cheapest layer — i.e. nothing affordable was left on the table.
+    leftover = budget - result.used_params
+    assert leftover < min(costs.values())
+
+
+def test_allocate_ranks_matches_brute_force_optimum_equal_costs():
+    """Fox (1966): marginal analysis is EXACTLY optimal for a separable
+    concave objective under a single linear constraint with equal per-unit
+    costs. Verified directly against exhaustive search."""
+    import itertools
+    import math
+    import random
+
+    from kadhi_cli.utils.allocate import allocate_ranks
+
+    def objective(ranks, scores):
+        return sum(scores[k] * math.log(1 + r) for k, r in ranks.items())
+
+    rng = random.Random(11)
+    for _ in range(60):
+        n = rng.choice([2, 3, 4])
+        r_max = rng.choice([6, 8])
+        scores = {f"l{i}": round(rng.uniform(0.1, 3.0), 3) for i in range(n)}
+        unit = rng.choice([2, 3, 5])
+        costs = {f"l{i}": unit for i in range(n)}
+        budget = rng.randint(6, 80)
+
+        result = allocate_ranks(
+            scores, costs, budget_params=budget, r_min=1, r_max=r_max
+        )
+        got = objective(dict(result.ranks), scores)
+
+        best = -1.0
+        keys = list(scores)
+        for combo in itertools.product(range(0, r_max + 1), repeat=n):
+            cand = dict(zip(keys, combo))
+            if sum(cand[k] * costs[k] for k in keys) > budget:
+                continue
+            best = max(best, objective(cand, scores))
+
+        assert got == pytest.approx(best, abs=1e-9)
+
+
+def test_allocate_ranks_lambda_star_is_last_accepted_efficiency():
+    """lambda_star is the shadow price of the budget constraint: the
+    objective-gain-per-parameter of the final increment the budget bought."""
+    from kadhi_cli.utils.allocate import allocate_ranks
+
+    scores = {"a": 3.0, "b": 1.0, "c": 7.0}
+    costs = {"a": 500, "b": 800, "c": 300}
+    result = allocate_ranks(scores, costs, budget_params=15_000, r_min=1, r_max=64)
+    assert result.lambda_star > 0
+    assert math.isfinite(result.lambda_star)
+
+
+def test_allocate_ranks_iterations_counts_accepted_increments():
+    from kadhi_cli.utils.allocate import allocate_ranks
+
+    scores = {"a": 3.0, "b": 1.0}
+    costs = {"a": 1000, "b": 1000}
+    # r_min=1 so every accepted increment is one unit of rank; total rank
+    # allocated must then equal the number of accepted increments.
+    result = allocate_ranks(scores, costs, budget_params=10_000, r_min=1, r_max=64)
+    assert result.iterations == sum(result.ranks.values())
+
+
+def test_allocate_ranks_max_iters_caps_accepted_increments():
     from kadhi_cli.utils.allocate import allocate_ranks
 
     scores = {"a": 3.0, "b": 1.0, "c": 7.0}
     costs = {"a": 500, "b": 800, "c": 300}
     result = allocate_ranks(
-        scores, costs, budget_params=15_000, max_iters=25, tolerance=1e-12
+        scores, costs, budget_params=1_000_000, r_min=1, r_max=64, max_iters=5
     )
-    assert result.iterations <= 25
-
-
-def test_allocate_ranks_loose_tolerance_converges_in_fewer_iterations():
-    from kadhi_cli.utils.allocate import allocate_ranks
-
-    scores = {"a": 3.0, "b": 1.0, "c": 7.0}
-    costs = {"a": 500, "b": 800, "c": 300}
-
-    loose = allocate_ranks(
-        scores, costs, budget_params=15_000, tolerance=1e-1, max_iters=200
-    )
-    tight = allocate_ranks(
-        scores, costs, budget_params=15_000, tolerance=1e-12, max_iters=200
-    )
-    assert loose.iterations <= tight.iterations
+    assert result.iterations <= 5

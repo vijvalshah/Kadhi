@@ -134,28 +134,47 @@ def fit_plan_to_budget(
     use_dora: bool,
     hardware_fit_base: "HardwareFitInput",
     vram_gb: float,
-    shrink_factor: float = 0.75,
-    max_iters: int = 6,
+    max_iters: int = 24,
 ) -> FitResult:
-    """Allocate, check feasibility, shrink the budget and retry on rejection.
+    """Find the LARGEST feasible trainable-parameter budget, by bisection.
 
     ``build_plan_fn(budget_params) -> PlanResult`` is supplied by the caller
-    rather than fixed to ``plan.build_static_plan`` so this loop works
-    identically whether the underlying scores came from the static SNR path
-    or a live gradient probe — this module only owns the feasibility
-    check-and-shrink, not how a plan gets produced. The expensive part of
-    producing a plan (an SNR scan, or a gradient probe) should be done ONCE
-    by the caller's closure and reused across iterations; only the
-    allocation itself needs to re-run per shrink, which is exactly what a
-    closure over already-computed scores/costs lets ``build_plan_fn`` do
-    cheaply.
+    rather than fixed to ``plan.build_static_plan``, so this loop works
+    identically whether the scores came from the static SNR path or a live
+    gradient probe — this module owns the feasibility search, not how a plan
+    gets produced. **The caller must do the expensive measurement (an SNR
+    scan, or a gradient probe) ONCE, outside its closure**, and have
+    ``build_plan_fn`` only re-run the cheap allocation; see
+    ``plan.compute_layer_signals`` / ``plan.plan_from_signals``. A closure
+    that calls ``plan.build_static_plan`` per invocation re-scans the whole
+    model on every iteration.
 
-    Stops as soon as a feasible plan is found. If ``max_iters`` is exhausted
-    without one, returns the LAST (still-infeasible) attempt rather than
-    raising — the caller can inspect ``FitResult.check.feasible`` and decide
-    what to do; silently raising would hide exactly the information (how
-    close did it get, what was the final gap) that makes an infeasible
-    result actionable rather than merely a failure.
+    *Why bisection rather than shrinking by a fixed factor.* The previous
+    implementation multiplied the budget by 0.75 on each rejection. That was
+    wrong in two ways. It **undershoots**: the first budget that happens to
+    fit after geometric decay is not the largest that would have fit, so
+    capacity is silently thrown away (0.75 decay can only ever land on
+    0.75^k of the original, so up to 25% of the feasible budget is
+    unreachable by construction). And it **fails to find feasible plans that
+    exist**: from a 50,000,000-parameter starting budget, six 0.75 steps only
+    reach 11,865,234 — measured on this codebase, that run reported "not
+    feasible" while feasible allocations existed far below.
+
+    Bisection is valid here because feasibility is monotone in the budget: a
+    larger ``budget_params`` lets the allocator spend at least as much, which
+    can only increase trainable parameters, which can only increase predicted
+    peak VRAM. So if budget B fits, every smaller budget fits too, and the
+    feasible set is an interval ``[0, B*]``. ``max_iters`` bisection steps
+    locate ``B*`` to within ``initial_budget_params / 2**max_iters`` — at the
+    default of 24, that is a relative precision of ~6e-8, far finer than the
+    granularity of a single unit of rank.
+
+    Returns the best FEASIBLE plan found. If none is feasible — including the
+    degenerate case where even a fully-frozen allocation does not fit, which
+    means no rank allocation can ever help — returns the last infeasible
+    attempt rather than raising, so the caller can inspect
+    ``FitResult.check`` and report the actual gap. Raising would discard
+    exactly the information that makes an infeasible result actionable.
     """
     if isinstance(initial_budget_params, bool):
         raise TypeError("initial_budget_params must be int, not bool")
@@ -163,43 +182,46 @@ def fit_plan_to_budget(
         raise ValueError(
             f"initial_budget_params must be a positive int, got {initial_budget_params!r}"
         )
-    if not (0.0 < shrink_factor < 1.0):
-        raise ValueError(f"shrink_factor must be in (0, 1), got {shrink_factor!r}")
     if isinstance(max_iters, bool) or not isinstance(max_iters, int) or max_iters < 1:
         raise ValueError(f"max_iters must be a positive int, got {max_iters!r}")
 
-    next_budget = initial_budget_params
-    plan_result: Optional["PlanResult"] = None
-    check: Optional[FeasibilityCheck] = None
-    # `used_budget` always names the budget that actually produced
-    # `plan_result`/`check` in the current loop body — kept distinct from
-    # `next_budget` (the shrunk value queued for the FOLLOWING iteration) so
-    # the final return, however the loop exits, reports the budget that was
-    # really used rather than one shrink-step ahead of it.
-    used_budget = next_budget
-    for iteration in range(1, max_iters + 1):
-        used_budget = next_budget
-        plan_result = build_plan_fn(used_budget)
-        check = check_plan_feasibility(
+    iterations = 0
+
+    def attempt(budget: int) -> "tuple[PlanResult, FeasibilityCheck]":
+        nonlocal iterations
+        iterations += 1
+        plan_result = build_plan_fn(budget)
+        return plan_result, check_plan_feasibility(
             plan_result, shapes, use_dora=use_dora,
             hardware_fit_base=hardware_fit_base, vram_gb=vram_gb,
         )
-        if check.feasible:
-            return FitResult(
-                plan=plan_result, check=check, budget_params_used=used_budget, iterations=iteration,
-            )
-        next_budget = max(1, int(used_budget * shrink_factor))
-        if next_budget == used_budget:
-            # Shrinking stalled (budget already at the floor) — stop rather
-            # than loop uselessly to max_iters on an unchanging budget.
-            return FitResult(
-                plan=plan_result, check=check, budget_params_used=used_budget, iterations=iteration,
-            )
 
-    # max_iters exhausted, never feasible — plan_result/check/used_budget are
-    # all set from the last iteration actually run (the loop always runs at
-    # least once, since max_iters >= 1 is validated above).
-    assert plan_result is not None and check is not None  # noqa: S101 — loop invariant
+    # The full budget is the best possible answer; try it before bisecting so
+    # the common case (it fits) costs exactly one evaluation.
+    plan_result, check = attempt(initial_budget_params)
+    if check.feasible:
+        return FitResult(
+            plan=plan_result, check=check,
+            budget_params_used=initial_budget_params, iterations=iterations,
+        )
+
+    best: "Optional[tuple[PlanResult, FeasibilityCheck, int]]" = None
+    last = (plan_result, check, initial_budget_params)
+    lo, hi = 1, initial_budget_params  # hi is known infeasible from above
+    while lo < hi and iterations < max_iters:
+        mid = (lo + hi) // 2
+        if mid == hi:  # integer bisection converged
+            break
+        plan_result, check = attempt(mid)
+        last = (plan_result, check, mid)
+        if check.feasible:
+            best = (plan_result, check, mid)
+            lo = mid + 1
+        else:
+            hi = mid
+
+    plan_result, check, budget_used = best if best is not None else last
     return FitResult(
-        plan=plan_result, check=check, budget_params_used=used_budget, iterations=max_iters,
+        plan=plan_result, check=check,
+        budget_params_used=budget_used, iterations=iterations,
     )

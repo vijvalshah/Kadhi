@@ -104,7 +104,7 @@ def allocate_cmd(
     from kadhi_cli.utils.hardware_fit import HardwareFitInput
     from kadhi_cli.utils.capacity import discover_lora_module_shapes
     from kadhi_cli.utils.feasibility import fit_plan_to_budget
-    from kadhi_cli.utils.plan import build_static_plan
+    from kadhi_cli.utils.plan import compute_layer_signals, plan_from_signals
 
     hardware_fit_base = HardwareFitInput(
         params_b=float(params_b), seq_len=seq_len, batch_size=batch_size,
@@ -120,17 +120,24 @@ def allocate_cmd(
         )
         raise typer.Exit(1)
 
-    def build(budget_params: int):
-        # build_static_plan doesn't take use_dora — DoRA's extra magnitude
-        # vector doesn't change the rank ALLOCATION (the concave objective is
-        # independent of it), only the trainable-parameter ACCOUNTING, which
-        # is where use_dora is applied instead (see fit_plan_to_budget below).
-        return build_static_plan(
-            cfg.base, lora_cfg.target_modules, budget_params=budget_params,
-            default_r=lora_cfg.r,
-        )
-
     try:
+        # Measure the model ONCE. fit_plan_to_budget calls build_plan_fn once
+        # per budget-shrink iteration; a closure over build_static_plan would
+        # re-run the full SVD scan of every weight matrix on every one of them
+        # (6 scans for 6 iterations — minutes each on a real 8B). The two-step
+        # API keeps the expensive half out of the loop.
+        signals = compute_layer_signals(cfg.base, lora_cfg.target_modules)
+
+        def build(budget_params: int):
+            # plan_from_signals doesn't take use_dora — DoRA's extra magnitude
+            # vector doesn't change the rank ALLOCATION (the concave objective
+            # is independent of it), only the trainable-parameter ACCOUNTING,
+            # which is where use_dora is applied instead (see
+            # fit_plan_to_budget below).
+            return plan_from_signals(
+                signals, budget_params=budget_params, default_r=lora_cfg.r,
+            )
+
         vram_gb = budget.vram_gb if budget.vram_gb is not None else 1_000_000.0
         result = fit_plan_to_budget(
             build, shapes, initial_budget_params=budget.trainable_params,
@@ -188,18 +195,37 @@ def allocate_cmd(
         vram_table.add_row("total", f"{breakdown.total_gb:.3f}")
         console.print(vram_table)
 
-    console.print(
-        Panel(
-            (
-                f"[green]Feasible.[/] Paste `lora.rank_pattern` from --explain "
-                "into your kadhi.yaml, or wire it in programmatically."
-                if check.feasible else
-                f"[red]Not feasible within {result.iterations} shrink attempt(s).[/] "
-                f"{escape(check.hardware_report.reason)}"
-            ),
-            title="allocate", border_style=style,
+    if check.feasible:
+        message = (
+            "[green]Feasible.[/] Paste `lora.rank_pattern` from --explain "
+            "into your kadhi.yaml, or wire it in programmatically."
         )
-    )
+    elif check.trainable_params == 0:
+        # The budget search bisects down to a fully-frozen allocation and it
+        # STILL does not fit, so the overflow is not the adapter's — it is
+        # base weights + activations + overhead alone. No rank allocation can
+        # help, and saying "not feasible" without saying that would send the
+        # operator off to tune a budget that was never the problem.
+        message = (
+            "[red]Not feasible at ANY rank.[/] Even with every layer frozen "
+            "(0 trainable parameters) the predicted peak is "
+            f"{check.hardware_report.peak_vram_gb:.2f} GB against a "
+            f"{check.hardware_report.available_vram_gb:.2f} GB ceiling — "
+            "the overflow is base weights, "
+            "activations and overhead, not the adapter. Lower "
+            "`data.max_length` or `training.batch_size`, enable "
+            "`training.gradient_checkpointing`, quantize further, or use "
+            "`training.stream_layers`. Raising the parameter budget cannot help."
+        )
+    else:
+        message = (
+            f"[red]Not feasible.[/] Searched down to "
+            f"{result.budget_params_used:,} trainable parameters over "
+            f"{result.iterations} evaluation(s). "
+            f"{escape(check.hardware_report.reason)}"
+        )
+
+    console.print(Panel(message, title="allocate", border_style=style))
     if not check.feasible:
         raise typer.Exit(3)
 

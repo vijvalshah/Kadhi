@@ -55,7 +55,7 @@ The controller answers both by measurement rather than by convention.
 ║   │  CAPACITY ALLOCATOR                              │      ║
 ║   │  max  Σ s(ℓ) · log(1 + r(ℓ))                     │      ║
 ║   │  s.t. Σ params(r(ℓ))  ≤  P_budget                │      ║
-║   │  marginal-utility equalisation, O(L log L)       │      ║
+║   │  greedy marginal analysis (Fox 1966)             │      ║
 ║   └───────────────────────┬──────────────────────────┘      ║
 ║                           ▼                                 ║
 ║   ┌──────────────────────────────────────────────────┐      ║
@@ -63,7 +63,7 @@ The controller answers both by measurement rather than by convention.
 ║   │  exact trainable-parameter accounting            │  │   ║
 ║   │  peak VRAM breakdown + safety margin             │  │   ║
 ║   │  infeasible ──────────────────────────────────────┘   ║
-║   │                       (reduce P_budget, reallocate)   ║
+║   │              (bisect P_budget for the largest fit)    ║
 ║   └───────────────────────┬──────────────────────────┘      ║
 ╚═══════════════════════════│═════════════════════════════════╝
                             ▼
@@ -164,11 +164,29 @@ A linear objective would be degenerate — it puts the entire budget into the si
 highest-scoring layer. Concavity encodes diminishing returns per layer, which is the
 behaviour rank actually exhibits, and produces an interior solution.
 
-At the optimum all active layers equalise marginal utility, `s(ℓ)/(1+r(ℓ)) = λ`, so
-the allocation is `r(ℓ) ∝ s(ℓ)` — computed directly by bisection on `λ`, then clamped
-to the admissible range and rounded to the nearest admissible rank. Layers falling
-below `r_min` are frozen rather than given a token rank. The whole allocation is
-`O(L log L)`; there is no search.
+The allocation is computed by **greedy marginal analysis** (Fox 1966): starting from
+every layer frozen, repeatedly spend the next slice of budget wherever it buys the most
+objective per parameter, stopping when nothing affordable remains. A layer's first
+increment is lumpy — it must jump straight to `r_min`, since intermediate ranks are
+inadmissible — and is priced on its average gain per parameter across that whole lump;
+subsequent increments are single units. The cost is `O(L · r_max · log L)` heap
+operations, a few thousand for any real model.
+
+Two properties matter more than the asymptotics. The allocation **cannot exceed the
+budget**, because no increment is ever accepted that would breach it. And it **spends
+what it can**: the loop only stops when every remaining candidate is unaffordable or
+already at `r_max`, so leftover budget is always smaller than the cheapest next
+increment.
+
+Marginal analysis is *exactly* optimal for a separable concave objective under a single
+linear constraint when per-unit costs are equal — which is the normal case here, since
+every decoder layer of a dense transformer has identical target-module dimensions
+(81,920 parameters per unit of rank at every layer of Llama-3.1-8B). Verified against
+exhaustive search: 200/200 exact. The `r_min` floor makes the feasible set non-convex,
+which costs exact optimality in principle, but measurably almost nothing in practice —
+the gap is under 0.02% at realistic layer counts and only appears at toy sizes of two to
+four layers. These figures are reproduced by
+`benchmarks/harness/allocator_optimality.py`.
 
 For a decoder of `L` layers the exact LoRA parameter count is closed-form:
 

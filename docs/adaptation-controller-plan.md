@@ -53,6 +53,31 @@ particular is estimated from a synthetic hidden-size proxy rather than the model
 actual configuration, and the safety margin is a chosen constant rather than a derived
 bound.
 
+**A specific, measured concern for that validation to settle.** The activation term
+uses `hidden ≈ 64·sqrt(params/1024)` as a stand-in for the per-token activation
+footprint. Compared against a principled estimate (`hidden × num_layers × ~10 live
+tensors × 2 bytes`) on real architectures, it comes out low, and increasingly so with
+scale:
+
+| Model | proxy bytes/token | principled bytes/token | ratio |
+|---|---|---|---|
+| SmolLM2-135M | 92,952 | 345,600 | 0.27× |
+| Llama-3.2-1B | 252,982 | 655,360 | 0.39× |
+| Llama-3.1-8B | 715,542 | 2,621,440 | 0.27× |
+| Llama-3.3-70B | 2,116,601 | 13,107,200 | 0.16× |
+
+The module docstring describes the math as "intentionally conservative". For the
+weights/optimizer/gradient terms it is. For activations it appears to be the
+opposite — under-predicting by 2.4×–6× — and that is the hazardous direction: the gate
+says "fits" and the run OOMs at step 1, instead of refusing cleanly up front. On the
+4 GB-class hardware this project targets, activations are a large share of peak.
+
+This was deliberately **not** patched here. Replacing one unvalidated constant with
+another unvalidated formula does not make the gate trustworthy; it just moves the
+guess. The principled figure above is itself an estimate. Phase 1's harness is the
+mechanism that settles it with measurement, and this table is the concrete hypothesis
+it should test first.
+
 *Verdict:* build. Cheap, standalone, publishable on its own, and it converts the
 feasibility gate from an assertion into a measurement. If the rest of the plan stalls,
 this phase still produced something real.
@@ -105,11 +130,35 @@ produces one. The field has consumers and no producer, and the automatic path th
 should fill it is a three-branch lookup on dataset size that consults neither the model,
 the hardware, nor any measurement.
 
-One correction from the first design pass, which mattered. The objective must be
-**concave** in rank. A linear objective under a linear budget constraint is degenerate:
-it assigns the entire budget to the single highest-scoring layer. `Σ s(ℓ)·log(1+r(ℓ))`
-encodes the diminishing returns rank actually exhibits and yields an interior solution
-via marginal-utility equalisation.
+Two corrections, both of which mattered.
+
+**The objective must be concave in rank.** A linear objective under a linear budget
+constraint is degenerate: it assigns the entire budget to the single highest-scoring
+layer. `Σ s(ℓ)·log(1+r(ℓ))` encodes the diminishing returns rank actually exhibits.
+
+**Solving the continuous relaxation was not good enough.** The first implementation
+found the Lagrange multiplier `λ*` by bisection, giving the closed form
+`r(ℓ;λ) = max(0, s(ℓ)/(λ·cost(ℓ)) − 1)`, then rounded and applied the `r_min` floor.
+That relaxation is correct, but flooring *after* `λ*` converged silently discarded
+budget — layers whose continuous rank landed just below `r_min` were frozen and their
+share was never redistributed, and nothing reclaimed it. Measured over 12 randomised
+realistic instances, the replacement scores **+26% mean / +82% worst-case** higher on
+the objective, and the relaxation left up to **88% of the budget unspent** (one
+instance committed 65,536 of 551,241 available parameters). It could also *exceed* the
+budget once several layers clamped to `r_max`; it reported that honestly via
+`over_budget`, but reporting a violated constraint is worse than not violating it.
+
+The replacement is **greedy marginal allocation** (Fox 1966, *Discrete optimization via
+marginal analysis*): repeatedly spend the next slice of budget wherever it buys the most
+objective per parameter. Verified against exhaustive search — **200/200 exactly optimal**
+with equal per-unit costs at `r_min=1`, which is the standard case, since every decoder
+layer of a dense transformer has identical target-module dimensions (81,920 parameters
+per unit of rank at every layer of Llama-3.1-8B). It cannot exceed the budget by
+construction.
+
+Every number in this section is reproduced by
+`benchmarks/harness/allocator_optimality.py`, which also re-implements the superseded
+algorithm so the comparison can be re-run after its removal from the codebase.
 
 *Verdict:* build. This is the component that makes the rest a system rather than a set
 of reports.

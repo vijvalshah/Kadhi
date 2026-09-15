@@ -24,8 +24,34 @@ def test_module_imports_without_heavy_deps():
     assert hasattr(sensitivity, "cache_path_for")
     assert hasattr(sensitivity, "save_sensitivity_report")
     assert hasattr(sensitivity, "load_sensitivity_report")
-    assert "torch" not in sys.modules
-    assert "numpy" not in sys.modules
+
+
+def test_no_heavy_deps_imported():
+    """Must run in a clean subprocess. An in-process ``sys.modules`` check is
+    poisoned by any sibling test in the same pytest session that legitimately
+    imports numpy/safetensors itself (several here and in test_feasibility.py
+    do), so it would pass or fail on test ORDER rather than on sensitivity.py's
+    actual top-level import graph — which is the only thing it should measure.
+    """
+    import subprocess
+
+    src_root = __import__("pathlib").Path(__file__).resolve().parents[1] / "src"
+    code = (
+        "import sys; "
+        "from kadhi_cli.utils import sensitivity; "
+        "heavy = [m for m in ('torch', 'numpy', 'transformers', 'peft') "
+        "if m in sys.modules]; "
+        "sys.exit(1) if heavy else sys.exit(0)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env={**__import__("os").environ, "PYTHONPATH": str(src_root)},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, (
+        "sensitivity.py's top-level import pulled in a heavy dependency "
+        f"(stdout={result.stdout!r}, stderr={result.stderr!r})"
+    )
 
 
 # ---------------------------------------------------------------------------
