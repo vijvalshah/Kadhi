@@ -33,13 +33,28 @@ layers' module paths SEPARATELY (``frozen_module_paths``) rather than
 guessing how to encode them, matching the open design question already
 recorded in adaptation-controller-plan.md §1.5.
 
+A separate concern this module also covers: producing a real ``rank_pattern``
+does not actually require the gradient-based sensitivity probe. Kadhi already
+has a static, task-independent layer signal — ``spectrum_scan``'s spectral
+SNR — computed straight from the same on-disk checkpoint capacity.py reads,
+with no live model load and no torch dependency at all (it falls back to a
+pure-numpy safetensors reader when torch is unavailable). ``aggregate_layer_snr``
+and ``build_static_plan`` compose capacity + spectrum_scan + allocate into a
+fully working, fully static Adaptation Controller pass — the gradient probe
+(``sensitivity.py``) is a strictly better, task-conditional signal to use in
+its place once a live training dataset and model are available, not a
+prerequisite for having a controller at all.
+
 Public surface:
 - ``layer_key(layer_index)`` -> str — the canonical string key used
   consistently across scores / costs / ranks throughout this bridge.
 - ``group_shapes_by_layer(shapes)`` -> dict[str, tuple[LoraModuleShape, ...]].
 - ``cost_per_unit_rank_from_shapes(shapes)`` -> dict[str, int].
+- ``aggregate_layer_snr(layer_snrs)`` -> dict[str, float].
 - ``PlanResult`` frozen dataclass.
 - ``rank_pattern_from_allocation(shapes, allocation, *, default_r)`` -> PlanResult.
+- ``build_static_plan(weights_dir, target_modules, *, budget_params,
+  default_r, r_min=4, r_max=64, modules="all")`` -> PlanResult.
 """
 
 from __future__ import annotations
@@ -55,6 +70,7 @@ from kadhi_cli.utils.lisa import _LAYER_RE
 if TYPE_CHECKING:
     from kadhi_cli.utils.allocate import AllocationResult
     from kadhi_cli.utils.capacity import LoraModuleShape
+    from kadhi_cli.utils.spectrum_scan import LayerSNR
 
 
 def layer_key(layer_index: int) -> str:
@@ -228,3 +244,102 @@ def rank_pattern_from_allocation(
         frozen_module_paths=tuple(sorted(frozen_module_paths)),
         default_r=default_r,
     )
+
+
+def aggregate_layer_snr(layer_snrs: "Sequence[LayerSNR]") -> "dict[str, float]":
+    """Average per-matrix spectral SNR into a per-layer score.
+
+    ``spectrum_scan.scan_weights_dir`` returns one :class:`LayerSNR` per
+    weight MATRIX; the allocator needs one score per LAYER. This averages
+    every matrix's ``snr`` that belongs to the same decoder layer (same
+    ``layer_key`` convention as the rest of this module), so the result is
+    directly usable as ``allocate_ranks``' ``scores`` argument.
+
+    A matrix whose name carries no ``layers.N.`` / ``h.N.`` segment is
+    skipped (mirrors ``group_shapes_by_layer``). Raises ValueError if nothing
+    aggregates.
+    """
+    grouped: dict[str, list[float]] = {}
+    for record in layer_snrs:
+        match = _LAYER_RE.search(record.name)
+        if match is None:
+            continue
+        key = layer_key(int(match.group(1)))
+        grouped.setdefault(key, []).append(float(record.snr))
+    if not grouped:
+        raise ValueError(
+            "aggregate_layer_snr: no LayerSNR name contains a 'layers.N.' / "
+            "'h.N.' segment — nothing to score."
+        )
+    return {key: sum(values) / len(values) for key, values in grouped.items()}
+
+
+def build_static_plan(
+    weights_dir: str,
+    target_modules: "str | Sequence[str]",
+    *,
+    budget_params: int,
+    default_r: int,
+    r_min: int = 4,
+    r_max: int = 64,
+    modules: str = "all",
+) -> PlanResult:
+    """Produce a real ``rank_pattern`` from an on-disk checkpoint alone.
+
+    Composes, in order:
+
+    1. ``capacity.discover_lora_module_shapes`` — real per-module shapes.
+    2. ``spectrum_scan.scan_weights_dir`` — real spectral SNR per matrix
+       (this is the STATIC, task-independent signal; see this module's
+       docstring for why the gradient probe is a better-but-optional
+       upgrade, not a prerequisite).
+    3. ``aggregate_layer_snr`` — per-layer score.
+    4. ``cost_per_unit_rank_from_shapes`` — per-layer cost.
+    5. ``allocate.allocate_ranks`` — the actual allocation.
+    6. ``rank_pattern_from_allocation`` — the final ``PlanResult``.
+
+    Every step is real: no live model load, no gradient computation, no
+    dataset — everything is derived from the checkpoint's own weights on
+    disk. Raises whatever the underlying step raises (a checkpoint with no
+    matching target modules, an unindexed architecture, an unreachable
+    budget) — this function does not add its own error handling on top,
+    since a caller needs to see exactly which step failed and why.
+    """
+    from kadhi_cli.utils.allocate import allocate_ranks
+    from kadhi_cli.utils.capacity import discover_lora_module_shapes
+    from kadhi_cli.utils.spectrum_scan import scan_weights_dir
+
+    shapes = discover_lora_module_shapes(weights_dir, target_modules)
+    if not shapes:
+        raise ValueError(
+            f"build_static_plan: no matching LoRA-eligible weights found "
+            f"under {weights_dir!r} for target_modules={target_modules!r}"
+        )
+    layer_snrs = scan_weights_dir(weights_dir, modules=modules)
+    scores = aggregate_layer_snr(layer_snrs)
+    cost = cost_per_unit_rank_from_shapes(shapes)
+
+    # scan_weights_dir and discover_lora_module_shapes can disagree on which
+    # layers they see (different module filters) — restrict to the
+    # intersection rather than letting allocate_ranks reject the mismatch,
+    # since a partial static signal is still useful for the layers it covers.
+    common = set(scores) & set(cost)
+    if not common:
+        raise ValueError(
+            "build_static_plan: the SNR scan and the LoRA module discovery "
+            "share no layer in common — check `modules` vs `target_modules`."
+        )
+    scores = {k: v for k, v in scores.items() if k in common}
+    cost = {k: v for k, v in cost.items() if k in common}
+    # Restrict shapes to layers present in `common` so rank_pattern_from_
+    # allocation's shapes/allocation key-set check passes even when a filter
+    # mismatch dropped some layers above.
+    shapes = tuple(
+        s for s in shapes
+        if (m := _LAYER_RE.search(s.name)) is not None and layer_key(int(m.group(1))) in common
+    )
+
+    allocation = allocate_ranks(
+        scores, cost, budget_params=budget_params, r_min=r_min, r_max=r_max,
+    )
+    return rank_pattern_from_allocation(shapes, allocation, default_r=default_r)

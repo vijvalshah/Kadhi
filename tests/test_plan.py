@@ -295,3 +295,117 @@ def test_full_pipeline_capacity_to_allocate_to_plan():
     } or {8}
     # The higher-scoring layer must not end up with a strictly lower rank.
     assert max(layer1_ranks) >= max(layer0_ranks)
+
+
+# ---------------------------------------------------------------------------
+# aggregate_layer_snr
+# ---------------------------------------------------------------------------
+
+def _snr(name, snr, shape=(4, 4)):
+    from kadhi_cli.utils.spectrum_scan import LayerSNR
+
+    return LayerSNR(name=name, module_type="attn", group="self_attn.q_proj", snr=snr, shape=shape)
+
+
+def test_aggregate_layer_snr_averages_within_a_layer():
+    from kadhi_cli.utils.plan import aggregate_layer_snr
+
+    records = [
+        _snr("model.layers.0.self_attn.q_proj.weight", 2.0),
+        _snr("model.layers.0.mlp.gate_proj.weight", 4.0),
+        _snr("model.layers.1.self_attn.q_proj.weight", 10.0),
+    ]
+    scores = aggregate_layer_snr(records)
+    assert scores == {"layer.0": 3.0, "layer.1": 10.0}
+
+
+def test_aggregate_layer_snr_skips_unindexed_and_raises_if_all_skipped():
+    from kadhi_cli.utils.plan import aggregate_layer_snr
+
+    with pytest.raises(ValueError, match="nothing to score"):
+        aggregate_layer_snr([_snr("model.embed_tokens.weight", 5.0)])
+
+
+# ---------------------------------------------------------------------------
+# build_static_plan — the full real pipeline against a REAL safetensors
+# checkpoint with REAL float32 data (not zero-byte fixtures): capacity.py's
+# shape discovery + spectrum_scan's actual SVD-based SNR + allocate.py's
+# actual bisection, composed exactly as build_static_plan wires them.
+# ---------------------------------------------------------------------------
+
+def _write_real_checkpoint(path, *, low_rank_layer: int, noise_layer: int, dim: int = 32):
+    """A tiny 2-layer synthetic checkpoint with genuinely different spectral
+    structure per layer, so compute_snr's real SVD produces a real,
+    directionally-meaningful difference (not an arbitrary number).
+
+    `low_rank_layer`'s q_proj is a rank-2 matrix (a few outer products) —
+    almost all its singular-value mass sits in a couple of dominant
+    components, which is exactly the "signal-heavy" shape compute_snr scores
+    high. `noise_layer`'s q_proj is iid Gaussian noise — a flat singular-value
+    spectrum with most mass below the Marchenko-Pastur threshold, which
+    compute_snr scores low.
+    """
+    import numpy as np
+    from safetensors.numpy import save_file
+
+    rng = np.random.default_rng(0)
+    u = rng.standard_normal((dim, 2)).astype(np.float32)
+    v = rng.standard_normal((2, dim)).astype(np.float32)
+    low_rank = (u @ v).astype(np.float32)
+    noise = rng.standard_normal((dim, dim)).astype(np.float32)
+
+    tensors = {
+        f"model.layers.{low_rank_layer}.self_attn.q_proj.weight": low_rank,
+        f"model.layers.{low_rank_layer}.self_attn.v_proj.weight": low_rank.copy(),
+        f"model.layers.{noise_layer}.self_attn.q_proj.weight": noise,
+        f"model.layers.{noise_layer}.self_attn.v_proj.weight": noise.copy(),
+    }
+    save_file(tensors, str(path))
+
+
+def test_build_static_plan_end_to_end_on_real_checkpoint(tmp_path):
+    pytest.importorskip("safetensors")
+    np = pytest.importorskip("numpy")
+
+    from kadhi_cli.utils.plan import build_static_plan
+
+    shard = tmp_path / "model.safetensors"
+    _write_real_checkpoint(shard, low_rank_layer=0, noise_layer=1)
+
+    result = build_static_plan(
+        str(tmp_path),
+        target_modules=["q_proj", "v_proj"],
+        budget_params=100_000,
+        default_r=8,
+        r_min=2,
+        r_max=32,
+    )
+
+    layer0_ranks = [v for k, v in result.rank_pattern.items() if ".layers.0." in k]
+    layer1_ranks = [v for k, v in result.rank_pattern.items() if ".layers.1." in k]
+    r0 = layer0_ranks[0] if layer0_ranks else 8  # 8 == default_r, omitted if allocated
+    r1 = layer1_ranks[0] if layer1_ranks else 8
+
+    # The low-rank (signal-heavy) layer must score higher on real SNR and
+    # therefore receive rank >= the noise layer's — this is the whole point
+    # of the allocator, verified against REAL spectral math, not a hand-fed
+    # score dict.
+    assert r0 >= r1, (
+        f"low-rank layer got rank {r0}, noise layer got rank {r1} — the "
+        "real SNR signal should favor the structured layer"
+    )
+
+
+def test_build_static_plan_raises_on_no_matching_target_modules(tmp_path):
+    from kadhi_cli.utils.plan import build_static_plan
+
+    shard = tmp_path / "model.safetensors"
+    _write_real_checkpoint(shard, low_rank_layer=0, noise_layer=1)
+
+    with pytest.raises(ValueError):
+        build_static_plan(
+            str(tmp_path),
+            target_modules=["definitely_not_a_real_module"],
+            budget_params=100_000,
+            default_r=8,
+        )
