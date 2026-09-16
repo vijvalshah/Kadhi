@@ -12,6 +12,7 @@
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> &middot;
+  <a href="#context-aware-capacity-allocation--the-adaptation-controller">Adaptation Controller</a> &middot;
   <a href="#web-ui">Web UI</a> &middot;
   <a href="#configuration">Config</a> &middot;
   <a href="#documentation">Docs</a> &middot;
@@ -57,25 +58,64 @@ Kadhi absorbs that layer so the only thing left to think about is the recipe.
 - 📄 **One YAML, one source of truth.** No scattered scripts, no hidden CLI flags to remember.
 - ⚙️ **Hardware-aware by default.** Batch size, quantization, and GPU detection are inferred, not guessed.
 - 🔒 **Runs on your own iron.** QLoRA on a local GPU — no mandatory cloud dependency.
+- 🧭 **Context-aware capacity allocation.** Instead of one rank applied uniformly everywhere,
+  Kadhi's [Adaptation Controller](#context-aware-capacity-allocation--the-adaptation-controller)
+  measures which layers *this task* actually pushes against and spends your parameter budget
+  there — see below.
 
 > Python **3.10–3.12** only. On 3.13+, pip used to resolve untested PyTorch wheels that
 > crash in the native extension before Kadhi runs at all.
 
-## In Development — Adaptation Controller
+## Context-Aware Capacity Allocation — the Adaptation Controller
 
-Kadhi picks a LoRA rank today from dataset size alone, and applies it uniformly to every
-layer. The Adaptation Controller replaces that with a measured decision: probe which
-layers the task actually pushes against, allocate rank across them under a
-trainable-parameter budget, check the plan against a validated peak-VRAM model before
-anything trains, and stop growing capacity when the quality gain drops below the
-measured noise floor.
+*Status: in development — see the phase table below before opening a PR against it.*
+
+Every other LoRA fine-tuner picks a rank from convention (a dataset-size heuristic, or
+just "64 everywhere") and applies it uniformly across the whole network. The **Adaptation
+Controller** replaces that with a measured, per-run decision: it probes which layers *this
+task, on this dataset* actually push against, allocates a trainable-parameter budget across
+exactly those layers, checks the resulting plan against a validated peak-VRAM model before a
+single step trains, and keeps growing capacity only until the quality gain drops below the
+measured noise floor — not until an arbitrary rank is hit.
+
+```mermaid
+flowchart TD
+    OP["Operator<br/>task + dataset · param/VRAM/time budget"]
+    OP --> PROBE
+
+    subgraph AC["Adaptation Controller"]
+        direction TB
+        PROBE["Layer Sensitivity Probe<br/><i>task-conditional saliency s(ℓ)</i>"]
+        ALLOC["Capacity Allocator<br/><i>greedy marginal analysis under budget</i>"]
+        RES["Resource Model<br/><i>exact param count + peak-VRAM feasibility</i>"]
+        PROBE --> ALLOC --> RES
+    end
+
+    RES -->|feasible| PLAN["Adaptation Plan<br/><code>lora.rank_pattern</code>"]
+    RES -->|infeasible: shrink budget, retry| ALLOC
+
+    PLAN --> TRAIN["Training Engine<br/>quantization · LoRA · layer streaming"]
+    TRAIN --> EVAL["Evaluation<br/>quality Q · wall-clock T · params P"]
+    EVAL --> MON{"Convergence Monitor<br/>ΔQ / ΔP &lt; ε ?"}
+    MON -->|sufficient| SHIP["Ship"]
+    MON -->|insufficient| GROW["Capacity Growth<br/>expand rank in place, resume optimizer state"]
+    GROW --> ALLOC
+    SHIP --> FRONTIER["Frontier Report<br/>non-dominated quality × params × time"]
+```
+
+`ε` isn't a tuning knob — it's derived from the measured seed-to-seed variance of the eval
+metric on the same configuration, so a stopping decision can be defended with a number
+instead of a convention. The full architecture, the math behind the allocator (a concave
+objective solved by greedy marginal analysis, verified 200/200 exact against exhaustive
+search), and how it relates to AdaLoRA/IncreLoRA/GoRA and friends are in
+[`docs/adaptation-controller.md`](docs/adaptation-controller.md).
 
 ```yaml
 controller:
   enabled: true
   budget:
-    trainable_params: 8M
-    vram: 4GB
+    trainable_params: 8000000
+    vram_gb: 4.0
   probe:
     steps: 50
 ```
