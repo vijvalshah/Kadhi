@@ -1,4 +1,4 @@
-<!-- synced-from: README.md sha256:de6c5bd06510e9fb0871ffacd6019e08eec4fdf72c1701c0d7b16cae9e47ceac -->
+<!-- synced-from: README.md sha256:b8ed65c4ce9df6f6072bbf35f509a22938ed59b37d4a4c101fcfa7dd99a0eb0d -->
 <p align="center">🌍 <a href="README.md">English</a> | <strong>Türkçe</strong></p>
 
 <p align="center">
@@ -12,36 +12,17 @@
 </p>
 
 <p align="center">
-  <a href="https://trykadhi.dev">Web sitesi</a> &middot;
   <a href="#hızlı-başlangıç">Hızlı Başlangıç</a> &middot;
   <a href="#web-arayüzü">Web Arayüzü</a> &middot;
   <a href="#yapılandırma">Yapılandırma</a> &middot;
   <a href="#belgeler">Belgeler</a> &middot;
   <a href="docs/commands.md">Komutlar</a> &middot;
-  <a href="docs/models.md">Modeller</a> &middot;
-  <a href="https://discord.gg/dgd2pJcjwP">Discord</a> &middot;
-  <a href="https://t.me/kadhitasters">Telegram</a> &middot;
-  <a href="https://www.producthunt.com/products/kadhi-cli">Product Hunt</a>
+  <a href="docs/models.md">Modeller</a>
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/kadhi-cli/"><img src="https://img.shields.io/pypi/v/kadhi-cli?color=6D5CE0" alt="PyPI"></a>
-  <a href="https://pepy.tech/project/kadhi-cli"><img src="https://img.shields.io/pepy/dt/kadhi-cli?color=6D5CE0" alt="İndirmeler"></a>
   <img src="https://img.shields.io/badge/python-3.10--3.12-6D5CE0" alt="Python 3.10-3.12">
   <img src="https://img.shields.io/badge/license-Apache--2.0-6D5CE0" alt="Apache-2.0 Lisansı">
-  <a href="https://trykadhi.dev"><img src="https://img.shields.io/badge/website-trykadhi.dev-FFB84C" alt="Web sitesi"></a>
-  <a href="https://discord.gg/dgd2pJcjwP"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
-  <a href="https://t.me/kadhitasters"><img src="https://img.shields.io/badge/Telegram-join-26A5E4?logo=telegram&logoColor=white" alt="Telegram"></a>
-  <a href="https://doi.org/10.5281/zenodo.21771064"><img src="https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21771064-FFB84C?logo=zenodo&logoColor=white" alt="DOI: 10.5281/zenodo.21771064"></a>
-</p>
-
-<p align="center">
-  <a href="https://www.producthunt.com/products/kadhi-cli?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-kadhi-cli">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1217869&amp;theme=dark">
-      <img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1217869&amp;theme=light" alt="Kadhi CLI - 4 GB dizüstü GPU'da 8B bir LLM'e ince ayar | Product Hunt" width="250" height="54">
-    </picture>
-  </a>
 </p>
 
 ---
@@ -63,14 +44,9 @@ ile bağımsız olarak yeniden üretildi. (tok/s rakamı, 32B'de −%4.8'e mal o
 onarımından önce, v0.72.2'de ölçüldü; o zamandan beri 4 GB bir kartta yeniden çalıştırılmadı.)
 İsteğe bağlıdır (`stream_layers: true`) ve hâlâ BETA —
 [nasıl çalışır](docs/performance-and-quantization.md#layer-streaming-beta-v0720-nf4-v0722-disk--wider-archs-v0723-preference-losses-v0724) ·
-[tüm ölçümler](benchmarks/) · [makale](https://doi.org/10.5281/zenodo.21771064) ·
+[tüm ölçümler](benchmarks/) ·
 **[ücretsiz bir Colab T4'te kendiniz doğrulayın](notebooks/proof-4gb.ipynb)** (işlemi 4 GB ile
 sınırlar, ardından akışlı bir modelin normal bir modelle bit düzeyinde özdeş olduğunu doğrular)
-
-<p align="center">
-  <a href="https://youtu.be/T1LCErE943E"><img src="docs/assets/layer-streaming.gif" alt="4 GB bir kartta Llama-3.1-8B için kadhi train ön kontrolü: 32 katman boyunca RAM'e sabitlenmiş 3.60 GB'lık bir taban deposu ve iki adet 113 MB VRAM tamponu, ardından 119.6 tok/s'de ölçülen 3.32 GB tepe; 4 GB çizgisinin altında kalıyor"></a><br>
-  <sub>Llama-3.1-8B-Instruct + NF4, LoRA, toplu iş 1, dizi 512, RTX 3050 Laptop 4 GB üzerinde — <b>3.32 GB tepe, 119.6 tok/s</b>. <a href="https://youtu.be/T1LCErE943E">Tam video (90 sn)</a></sub>
-</p>
 
 ## Kadhi'nın çözdüğü sorun
 
@@ -84,46 +60,8 @@ tarif kalır.
 - ⚙️ **Donanımı varsayılan olarak tanır.** Toplu iş boyutu, niceleme ve GPU algılama tahmin edilmez, çıkarılır.
 - 🔒 **Kendi donanımınızda çalışır.** Kendi GPU'nuzda QLoRA — zorunlu bulut bağımlılığı yok.
 
-## Yenilikler
-
-**v0.75.0 — aynı `kadhi.yaml`, MLX'te transformers'takinden farklı bir tarif eğitiyordu,
-sessizce.** Altı eğitim seçeneği doğrulanıyor, belgeleniyor, kabul ediliyor — ve o arka uçta
-hiçbir şey tarafından okunmuyordu. **Bu sürümdeki 60 pull request'in tamamı bakımcı dışından
-geldi**, 22 kişiden.
-
-- **Kırıcı değişiklik: bilinmeyen bir yapılandırma anahtarı artık yüklemeyi reddediyor.**
-  v0.74 uyarmış ve son tarih olarak bu sürümü belirlemişti. `quantizaton` gibi bir yazım
-  hatası ya da yalnızca daha yeni bir Kadhi sürümünde bulunan bir anahtar eskiden yoksayılıyor ve
-  çalıştırma o ayar uygulanmadan devam ediyordu; artık CLI'da (çıkış kodu 1) ve API'de
-  (`ValueError`) reddediliyor ve muhtemelen kastettiğiniz alanı belirtiyor. Tespit edici,
-  şemanın v0.40.1'den beri desteklediği kök düzeyindeki `lora:` yeniden eşlemesini uyguluyor;
-  yani bu yazım reddedilmiyor, kabul ediliyor. Bu yazımı kullanan iki `kadhi fetch examples`
-  dosyası standart `training.lora` biçimine taşındı. Tüm tarif ve şablonlar sorunsuz yükleniyor,
-  anahtar adları terminale ulaşmadan önce filtreleniyor ve tarama sınırlandırılmış durumda.
-- **MLX, kabul ettiği yapılandırmaya uyuyor.** `train_on_responses_only`, `warmup_ratio` /
-  `scheduler` / `weight_decay` / `optimizer`, `max_grad_norm`, `gradient_accumulation_steps`
-  ve `gradient_checkpointing`, `backend: mlx` üzerinde tek tek doğrulanıp sonra düşürülüyordu.
-  32 optimizer adından yalnızca 8'inin MLX karşılığı var; diğer 24'ü sessizce AdamW'ye
-  dönüşmek yerine adıyla reddediliyor. MLX ayrıca canlı panoyu, izleyiciyi ve `kadhi ui`'yi
-  sürüyor; `kadhi doctor --config` ise bir arka ucun okumadığı ayarları listeliyor.
-- **Doğrulama kaybı hiçbir yerde yoktu.** Her arka uçta hesaplanıp atılıyordu: metrik sütunu
-  yok, olay alanı yok, panoda hiçbir şey yok. Artık kaydediliyor, akıtılıyor ve gösteriliyor.
-- **Geriye dönük uyumsuz: `grpo_variant: gspo`, yayımlanmış dizi düzeyi hedef fonksiyonudur**
-  (arXiv:2507.18071); bir dolgu belirtecinin aynı sütunu paylaşan her satırın gradyanını da
-  kaydırdığı sütun merkezleme sezgiselinin yerini alıyor. Mevcut gspo yapılandırmaları önceki
-  çalıştırmaları yeniden üretmeyecek.
-- **Web arayüzünün okuma uç noktaları ve SSE, kimlik doğrulama gerektiriyor**; sorgu
-  dizesindeki bir belirteç yerine kısa ömürlü, tek kullanımlık biletlerle. `--public` artık
-  `/docs` ve `/openapi.json`'ı yerel ağa sunmuyor; eğitim alt süreci de çıktısını kimse
-  okumadığında artık askıda kalmıyor.
-- **`torch>=2.6.0`**, v0.74.0'ın bilinen sınırlamasını kapatıyor: 2.5.1'de `trl>=0.29` içe
-  aktarılamıyor ve her tercih eğiticisi ölüydü. Ayrıca düzeltildi: `training.loraplus_lr_ratio`
-  onu ayarlayan her çalıştırmayı çökertiyordu ve `packing: true` TRL 0.29'da hata veriyordu.
-
 > Yalnızca Python **3.10–3.12**. 3.13+ sürümlerinde pip, Kadhi daha hiç çalışmadan yerel
 > eklentide çöken, test edilmemiş PyTorch tekerleklerini çözümlüyordu.
-
-Eski sürümlerin öne çıkanları [CHANGELOG.md](CHANGELOG.md) içinde.
 
 ## Hızlı Başlangıç
 
@@ -208,8 +146,6 @@ pip install "kadhi-cli[ui]"
 kadhi ui
 # http://127.0.0.1:7860 adresini açar
 ```
-
-![Kadhi Web Arayüzü — Yeni Eğitim](docs/assets/web-ui-new-training.png)
 
 [Web Arayüzü belgeleri](docs/serving-and-export.md#web-ui)
 
@@ -363,26 +299,8 @@ varsayılan kapalı; bkz. [Gizlilik Politikası](docs/backends-and-ops.md#privac
 
 ## Kadhi'u Destekleyin
 
-Kadhi Apache-2.0 lisanslı ve ücretsizdir — ve öyle kalacak. Tek bir 4 GB dizüstü bilgisayarda, açık
-olarak geliştirilir ve sürdürülür; bu belgelerdeki her performans rakamının iddia edilmek yerine
-ölçülmüş olmasının nedeni budur.
-
-Kadhi size bir eğitim çalıştırması kazandırdıysa, depoya yıldız vermek en çok yardımı sağlar ve
-hiçbir maliyeti yoktur. Çalışmayı doğrudan finanse etmek isterseniz:
-
-**[❤️ Bağış yapın](https://buy.stripe.com/4gMcN441k3pha3T19ye7m04)** — tek seferlik, istediğiniz
-miktarda (ödeme sayfasında *Tutarı değiştir* / *Change amount* seçeneğini kullanın). Ödemeler,
-bakımcının kayıtlı işletmesi **MePlay, Inc.** adına Stripe tarafından işlenir — ödeme sayfasında ve
-kart ekstrenizde "Kadhi" değil, bu ad görünür.
-
-Bağışlar, donanıma bağlı işler için GPU süresi satın alır — çoklu GPU, 8B+ doğrulama, Apple
-Silicon — tek bir 4 GB dizüstünün ulaşamadığı işler.
-
-Tam da bu kalemleri ilerletmenin diğer yolu **donanımın kendisidir**. Bunlar doğrulanmamış iddialar
-yerine dürüst "\<donanım\> gerektirir" kapılarının arkasında yayımlanır; dolayısıyla daha büyük bir
-makineye — ya da kullanılmayan GPU kredilerine — erişiminiz varsa, sorun takipçisindeki
-`help wanted` konularından birini çalıştırıp sayıları paylaşmak, GPU süresini finanse etmek kadar
-yardımcı olur. Bu konular, bugün donanım yüzünden tam olarak neyin engellendiğini söyler.
+Kadhi Apache-2.0 lisanslı ve ücretsizdir — ve öyle kalacak. Depoya yıldız vermek hiçbir maliyeti
+yoktur ve başkalarının onu bulmasına yardımcı olur.
 
 ## Katkıda Bulunanlar
 
@@ -393,76 +311,13 @@ Topluluk tarafından inşa edildi ❤️ — katkıda bulunan herkese teşekkür
 
 Hatalar ve özellik istekleri sorun takipçisine, sorular Discussions'a aittir — ikisi de daha
 hızlı yanıtlanır ve aynı sorunu yaşayan bir sonraki kişiye yardım eder.
-
-Canlı sohbet, kurulum yardımı ve sohbet olarak daha iyi okunan her şey için
-[Discord](https://discord.gg/dgd2pJcjwP)'a ya da [Telegram topluluğuna](https://t.me/kadhitasters)
-katılın. Altı ay sonra hâlâ bulunabilir olması gereken her şey Issues'a ya da Discussions'a aittir —
-bir Discord yanıtı tek bir kişiye yardım eder, bir issue ise aynı şeyle karşılaşan herkese.
 [Davranış Kuralları](CODE_OF_CONDUCT.md) orada da geçerlidir.
 
-Herkese açık olmaya uygun olmayan her şey için — güvenlik bildirimleri (bkz. [SECURITY.md](SECURITY.md)),
-Davranış Kuralları meseleleri ya da basın — **team@trykadhi.dev** adresine e-posta gönderin. Bu,
-projenin adresidir ve Kadhi'la ilgili her şey için doğru adres budur. **makazanalpamys@gmail.com**
-bakımcının kişisel adresidir; aynı kişiye ulaşır ve iyi bir yedektir.
+Herkese açık olmaya uygun olmayan her şey için — güvenlik bildirimleri, bkz. [SECURITY.md](SECURITY.md).
 
-## Kadhi'a Atıf
-
-Katman akışı — dondurulmuş tabanı ana bilgisayar RAM'inden her seferinde bir kod çözücü katman
-olarak aktararak 4 GB dizüstü GPU'da 8B bir model eğitmek — bir ön baskıda, akışlı bir çalıştırmayı
-belleğe yerleşik bir çalıştırmaya karşı doğrulayan doğruluk protokolüyle birlikte anlatılır (ileri
-ve geri geçiş ayrı ayrı belirtilir; çünkü bunlar tek değil, iki iddiadır).
-
-> Makazhan, A. (2026). *Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model on a 4 GB Laptop
-> GPU* (v3). Zenodo. https://doi.org/10.5281/zenodo.21918325
-
-**Sürüm 3 (13 Ağustos 2026) günceldir.** Başlık ve iddia değişmedi — 4 GB'da 8B — ve v1'den bu yana
-ölçülmüş hiçbir sayı değişmedi. v3'ün yaptığı şey **yayımladığımız bir açıklamayı geri çekmektir**;
-bu aynı zamanda makalenin ne işe yaradığını anlatmanın en kısa yoludur:
-
-- **v3'te geri çekildi: "katman akışını sınırlayan GPU değil, ana bilgisayardan cihaza aktarımdır."**
-  Bu, aşağıdaki H100 yeniden üretiminden yapılmış bir *çıkarımdı* ve hiç ölçülmemişti. 11 Ağustos'ta
-  ölçtük ve yayımlanan yapılandırmada yanlış: ana bilgisayardan cihaza giden her baytı silmek
-  yalnızca **%1.4** kazandırıyor, hesaplama akışı adımın **%0.20**'sinde bir kopyayı bekliyor ve
-  adım, o kartın aynı oturumdaki GEMM tavanının **%71.3**'ünde çalışıyor. Akışa özgü en büyük
-  maliyet, %9.8 ile katman başına NF4 ters nicelemesi
-  ([kayıt](benchmarks/probe-v0.73.0-what-bounds-streaming.md)). Her ölçüm geçerliliğini koruyor;
-  yeniden üretim daha zayıf bir biçimde ayakta kalıyor — kısıt her iki makinede ortak ve GPU'nun
-  hesaplama gücü değil.
-- **Özgününe hiç benzemeyen donanımda yeniden üretim** (v2'de eklendi): RTX 3050'de 119.6 tok/s'ye
-  karşı bir H100'de medyan 113.00, aynı 3.32 GB tepede.
-- **Sessiz bir yanlış gradyan kusuru, bulundu ve onarıldı.** Katman başına ~165 MiB'ın üzerindeki
-  NF4'te ileri geçiş bit düzeyinde özdeş kaldı ve kayıp eğrisi sağlıklı göründü, ama gradyanlar
-  yanlıştı. Neden, üst akış kütüphanesinde adıyla belirtildi ve orada bildirildi; onarım, gerçek 32B
-  ve 72B üzerinde kontrollere karşı kapılandı.
-- **Gerçek model boyutlarında bit düzeyinde özdeşlik**, üç katmanlı oyuncaklar yerine: ileri geçiş
-  0.5B'den 72B'ye, geri geçiş 8B ve 14B'de.
-- **Eğitilmiş model kalitesi, ilk kez ölçüldü** ve belleğe yerleşik bir çalıştırmadan ayırt
-  edilemiyor.
-- **DeepSpeed ile karşılaştırma** — bizi pohpohlamayan sonuç dahil: sekiz kartlık ZeRO-3, belleğe
-  yerleşik eğiten tek bir karttan daha yavaş.
-- **Sınırlamalar bölümü yeniden yazıldı**: v1'in on maddesinden biri kapandı, dördü daha daraldı ve
-  yedi yeni madde eklendi.
-
-Kullandığınız sürüme atıf yapın. `10.5281/zenodo.21771064` kavram DOI'sidir ve her zaman en son
-sürüme (bugün v3) çözümlenir; v1 ve v2 kendi sürüm DOI'leriyle atıf yapılabilir durumda kalır ve
-düzenlenmez — yukarıdaki geri çekme, neyi ne zaman iddia ettiğimizin kaydı bozulmadan kalsın diye
-tam da bu yüzden yeni bir sürümdür.
-
-Makaledeki her sayının arkasındaki ölçüm kayıtları, yazıldığı haliyle [`benchmarks/`](benchmarks/)
-içinde yayımlanmıştır — başarısızlıklar, yanlış çıkan varsayımlar ve ölçülüp sonra atılan sayılar
-dahil.
-
-```bibtex
-@misc{makazhan2026exact,
-  title        = {Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model on a 4 GB Laptop GPU},
-  author       = {Makazhan, Alpamys},
-  year         = {2026},
-  publisher    = {Zenodo},
-  version      = {v3},
-  doi          = {10.5281/zenodo.21918325},
-  url          = {https://doi.org/10.5281/zenodo.21918325}
-}
-```
+Bu README'deki performans rakamlarının arkasındaki ölçüm kayıtları, yazıldığı haliyle
+[`benchmarks/`](benchmarks/) içinde yayımlanmıştır — başarısızlıklar, yanlış çıkan varsayımlar ve
+ölçülüp sonra atılan sayılar dahil.
 
 ## Lisans
 

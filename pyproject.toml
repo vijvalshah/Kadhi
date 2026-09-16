@@ -218,7 +218,6 @@ kadhi = "kadhi_cli.cli:run"
 
 [project.urls]
 Homepage = "https://trykadhi.dev"
-Discord = "https://discord.gg/dgd2pJcjwP"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kadhi_cli"]

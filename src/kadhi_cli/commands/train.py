@@ -134,6 +134,39 @@ def _build_hardware_fit_input(cfg):
     if optimizer not in _HW_FIT_OPTIMIZERS:
         optimizer = "adamw_torch"
     gc = bool(getattr(tcfg, "gradient_checkpointing", False))
+
+    # Phase 1 resource-model correction (adaptation-controller-plan.md
+    # §1.1): the flat 1%-of-params LoRA fraction below is rank-blind and
+    # roughly an order of magnitude over-cautious. ``utils/capacity.py``
+    # gives an exact, rank-aware count by reading the target modules'
+    # d_in/d_out straight out of the checkpoint's on-disk ``.safetensors``
+    # headers — no network fetch, no remote config. That only exists when
+    # the base model is ALREADY a local directory: training requires the
+    # checkpoint to be locally resident before it can start anyway, so
+    # "weights are local" is available at real pre-flight time for the
+    # common case, and this predictor is already explicitly CUDA-resident-
+    # weights-only (it bails out on ``stream_layers`` and ``backend: mlx``
+    # above the caller of this function). When the checkpoint isn't local,
+    # or the exact estimate can't be produced, ``trainable_params`` is left
+    # unset and the existing 1% heuristic below applies unchanged.
+    trainable_params = None
+    if peft in ("lora", "qlora", "dora") and os.path.isdir(str(getattr(cfg, "base", "") or "")):
+        try:
+            from kadhi_cli.utils.capacity import (
+                estimate_lora_trainable_params_from_checkpoint,
+            )
+
+            lora_cfg = tcfg.lora
+            trainable_params = estimate_lora_trainable_params_from_checkpoint(
+                weights_dir=cfg.base,
+                target_modules=lora_cfg.target_modules,
+                default_r=lora_cfg.r,
+                rank_pattern=lora_cfg.rank_pattern,
+                use_dora=lora_cfg.use_dora,
+            )
+        except (AttributeError, TypeError, ValueError, OSError):
+            trainable_params = None  # fail open: fall back to the 1% heuristic
+
     try:
         return HardwareFitInput(
             params_b=float(params_b),
@@ -143,6 +176,7 @@ def _build_hardware_fit_input(cfg):
             quant=quant,
             peft=peft,
             gradient_checkpointing=gc,
+            trainable_params=trainable_params,
         )
     except (ValueError, TypeError):
         return None  # dims out of the predictor's supported range

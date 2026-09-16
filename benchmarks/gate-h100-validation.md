@@ -4899,12 +4899,11 @@ what was measured; no claim about whether the base is sharded is made from it.
 
 ---
 
-## Does any of this change the preprint?
+## Does any of this change the earlier layer-streaming measurements?
 
-The preprint (*Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model on a 4 GB
-Laptop GPU*, DOI [10.5281/zenodo.21771064](https://doi.org/10.5281/zenodo.21771064))
-measures Llama-3.1-8B NF4 on a 4 GB card. A published DOI cannot be quietly
-corrected, so this is answered explicitly rather than left implicit.
+The earlier record (*Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model on a 4 GB
+Laptop GPU*) measures Llama-3.1-8B NF4 on a 4 GB card. That record is answered
+explicitly here rather than left implicit.
 
 **No measured number in it changes, and nothing in it is invalidated.** That
 verdict was reached while the defect was still open and it survives the repair —

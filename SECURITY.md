@@ -15,9 +15,7 @@ running the most recent version from PyPI (`pip install -U kadhi-cli`).
 Please report security issues **privately** — do not open a public GitHub issue
 for anything security-sensitive.
 
-- Preferred: email **team@trykadhi.dev** (the project address), or
-  **makazanalpamys@gmail.com** (the maintainer's personal address) if that bounces.
-  Please do not report security issues in Discord — it is a public channel.
+- Preferred: open a private GitHub Security Advisory on this repository.
 
 We aim to acknowledge reports within 5 business days and to ship a fix or
 mitigation for confirmed, in-scope issues as promptly as is practical. When

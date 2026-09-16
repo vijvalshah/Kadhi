@@ -17,6 +17,8 @@ feature reference — every `kadhi` capability, grouped by area.
 | [Adapters, registry & governance](adapters-and-governance.md) | Adapter lifecycle/management, model registry, Kadhi Cans, the data flywheel (`kadhi loop`), knowledge editing, steering, supply-chain controls |
 | [Compliance & governance quickstart](compliance.md) | HIPAA/SOC2/EU-AI-Act/SR-11-7 `init` templates, provenance (BOM/attest/repro-receipt), audit log, air-gap, model-card autogen (`kadhi card`), CI gate (`kadhi ci init`) |
 | [Backends, platform & ops](backends-and-ops.md) | MLX/Unsloth backends, Modal cloud GPU training, alternative hubs, HF Hub integration, autopilot, experiment tracking, plan/apply, env lockfiles, hardware-fit, completions, plugins, utility commands |
+| [Adaptation Controller](adaptation-controller.md) | Importance-driven capacity allocation: layer sensitivity probing, `rank_pattern` generation under a trainable-parameter budget, VRAM feasibility as a hard constraint, noise-calibrated stopping |
+| [Adaptation Controller build plan](adaptation-controller-plan.md) | Phased delivery plan, per-component design rationale, acceptance criteria and risks |
 | [Command reference](commands.md) | The full `kadhi` command list |
 | [Supported models & extras](models.md) | Recommended model families, the VRAM size guide, the pip extras matrix |
 

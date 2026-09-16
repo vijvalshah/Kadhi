@@ -936,6 +936,110 @@ class DataConfig(BaseModel):
         return self
 
 
+class ControllerBudgetConfig(BaseModel):
+    """Resource budget for the Adaptation Controller (see
+    docs/adaptation-controller.md §4). All fields are plain numeric types in
+    the same units the rest of this schema already uses elsewhere
+    (``training.stream_vram_override`` is bytes; VRAM here is GB to match
+    ``utils.hardware_fit.HardwareFitInput`` and its GB-denominated report) —
+    deliberately NOT human-readable suffix strings ("8M", "4h", "4GB"): no
+    such parser exists anywhere else in this schema, and inventing one just
+    for this block would be a new, undocumented convention rather than a
+    reuse of an existing one.
+    """
+
+    trainable_params: Optional[int] = Field(
+        default=None, ge=1,
+        description=(
+            "Maximum trainable LoRA parameters the allocator (utils/allocate.py) "
+            "may spend across all layers. Passed to allocate_ranks(budget_params=...)."
+        ),
+    )
+    wall_clock_seconds: Optional[int] = Field(
+        default=None, ge=1,
+        description="Soft wall-clock budget in seconds, including probe + planning time.",
+    )
+    vram_gb: Optional[float] = Field(
+        default=None, gt=0.0,
+        description=(
+            "Hard VRAM feasibility ceiling in GB, checked against "
+            "utils.hardware_fit.estimate_peak_vram_gb. A plan predicted to "
+            "exceed this is rejected, not merely warned about."
+        ),
+    )
+
+
+class ControllerProbeConfig(BaseModel):
+    """Layer-sensitivity probe settings (utils/sensitivity.py)."""
+
+    steps: int = Field(
+        default=50, ge=1, le=10_000,
+        description=(
+            "Forward+backward probe steps for compute_layer_sensitivity. No "
+            "optimizer step occurs — this only accumulates gradient-based "
+            "importance scores, it does not train the model."
+        ),
+    )
+    corroborate: List[Literal["spectrum", "shrink"]] = Field(
+        default_factory=list,
+        description=(
+            "Static, task-independent layer signals to report rank-correlation "
+            "against (kadhi spectrum / kadhi shrink). Informational only — "
+            "does not change the allocation, only what a `plan --explain` "
+            "report shows alongside it."
+        ),
+    )
+
+
+class ControllerGrowthConfig(BaseModel):
+    """In-place capacity growth settings (Phase 4 — see
+    adaptation-controller-plan.md §1.6). Schema-only: no growth loop is
+    wired to this block yet.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Grow rank in place across stages instead of stopping at the first allocation.",
+    )
+    max_stages: int = Field(
+        default=3, ge=1, le=20,
+        description="Maximum number of growth stages before stopping regardless of the convergence check.",
+    )
+
+
+class ControllerConfig(BaseModel):
+    """Adaptation Controller config (schema-only — see
+    docs/adaptation-controller.md and docs/adaptation-controller-plan.md).
+
+    Mirrors the ``AdviseConfig`` precedent immediately below: this surfaces
+    the controller's knobs through ``kadhi.yaml`` so a config can carry them
+    persistently, ahead of the CLI command that will consume them
+    (``kadhi plan``, not yet built). ``utils/capacity.py``, ``utils/allocate.py``,
+    and ``utils/sensitivity.py`` exist and are independently tested as of
+    this field's addition; nothing yet wires this config block to them —
+    setting ``enabled: true`` in a ``kadhi.yaml`` today has no runtime effect
+    beyond the validation below.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Turn the Adaptation Controller on. No-op until `kadhi plan` lands.",
+    )
+    budget: ControllerBudgetConfig = Field(default_factory=ControllerBudgetConfig)
+    probe: ControllerProbeConfig = Field(default_factory=ControllerProbeConfig)
+    growth: ControllerGrowthConfig = Field(default_factory=ControllerGrowthConfig)
+
+    @model_validator(mode="after")
+    def _require_a_budget_when_enabled(self) -> "ControllerConfig":
+        if self.enabled and self.budget.trainable_params is None and self.budget.vram_gb is None:
+            raise ValueError(
+                "controller.budget needs trainable_params or vram_gb "
+                "when controller.enabled=true — the allocator has nothing "
+                "to allocate against otherwise"
+            )
+        return self
+
+
 class AdviseConfig(BaseModel):
     """Pre-flight decision config (v0.54.0 — schema-only).
 
@@ -4344,6 +4448,13 @@ class KadhiConfig(BaseModel):
     advise: Optional[AdviseConfig] = Field(
         default=None,
         description="Pre-flight decision settings consumed by `kadhi advise`.",
+    )
+    controller: Optional[ControllerConfig] = Field(
+        default=None,
+        description=(
+            "Adaptation Controller settings (schema-only — see "
+            "docs/adaptation-controller.md). Not yet consumed by any command."
+        ),
     )
 
     @field_validator("experiment_name")

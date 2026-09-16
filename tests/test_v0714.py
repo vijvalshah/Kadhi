@@ -1168,8 +1168,8 @@ class TestParsePrTarget:
         from kadhi_cli.utils.adapter_pr import parse_pr_target
 
         assert parse_pr_target("owner/repo#42") == (
-            "MakazhanAlpamys",
-            "Kadhi",
+            "owner",
+            "repo",
             42,
         )
 
