@@ -289,14 +289,12 @@ would grep for:
 
 ---
 
-## 8. Effect on the preprint — asked and answered, not left implicit
+## 8. Effect on the layer-streaming record — asked and answered, not left implicit
 
-The layer-streaming preprint (DOI
-[10.5281/zenodo.21918325](https://doi.org/10.5281/zenodo.21918325), v3) uses
-`kadhi ship` as its **measuring instrument** in the convergence-quality section,
-so this release has to be checked against it before tagging.
+The layer-streaming measurement record uses `kadhi ship` as its **measuring instrument** in
+the convergence-quality section, so this release has to be checked against it before tagging.
 
-**Does v0.73.2 change a MEASURED number the paper states?** Not retroactively,
+**Does v0.73.2 change a MEASURED number the record states?** Not retroactively,
 but it does change the instrument those numbers were taken with. The paper
 reports leg-2 reproducibility as `mini_common_sense` moving **0.375** and
 `mini_mmlu` **0.269** across three identical resident runs, and a 3-versus-1

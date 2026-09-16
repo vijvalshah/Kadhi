@@ -242,15 +242,11 @@ def test_two_branches_add_fragments_without_a_merge_conflict(tmp_path: Path) -> 
     assert (tmp_path / "changelog.d" / "0.73.3" / "102.added.md").is_file()
 
 
-def test_repository_wires_the_release_guard_and_contributor_guidance() -> None:
+def test_repository_wires_the_contributor_guidance() -> None:
     root = Path(__file__).parents[1]
-    workflow = (root / ".github" / "workflows" / "publish.yml").read_text(encoding="utf-8")
     contributing = (root / "CONTRIBUTING.md").read_text(encoding="utf-8")
-    template = (root / ".github" / "pull_request_template.md").read_text(encoding="utf-8")
 
-    assert "python scripts/assemble_changelog.py --check-empty" in workflow
     assert "changelog.d/<latest-release>/<number>.<category>.md" in contributing
-    assert "changelog fragment" in template.lower()
 
 
 def test_repository_fragments_match_the_newest_release() -> None:

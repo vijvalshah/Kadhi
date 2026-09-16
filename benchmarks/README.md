@@ -8,12 +8,6 @@ kept while each item was built and verified, so they contain the failures, the
 assumptions that turned out wrong, and the numbers that were measured and then
 discarded — in the order those things happened.
 
-They are the evidence behind the preprint:
-
-> Makazhan, A. (2026). *Exact Layer Streaming: LoRA Fine-Tuning of an 8B Model
-> on a 4 GB Laptop GPU.* Zenodo.
-> [10.5281/zenodo.21771064](https://doi.org/10.5281/zenodo.21771064)
-
 | File | What it gates | Headline |
 |---|---|---|
 | [`gate-674-quest-w4a4-sft.md`](gate-674-quest-w4a4-sft.md) | Experimental QuEST W4A4 SFT feasibility (#674); not an integration | **Gate failed:** 0.114 nat [0.099, 0.130] above the strongest retained FP on the same panel. One training seed, one model, fake quantization; no parity or efficiency claim. Retains failed directions, costs, source/result hashes and spent-panel history; FINAL256 remains untouched. |
