@@ -327,9 +327,10 @@ first.**
   needs a per-module expansion `allocate_ranks` was never going to produce on
   its own, and that a working controller does not require a gradient probe.
 - Feasibility loop: allocate, check against the phase-1 resource model, reduce the
-  budget and re-allocate on rejection. **Not built.** `build_static_plan` does
-  not yet call `hardware_fit`; a plan can be produced that the resource model
-  would refuse, and nothing today closes that loop.
+  budget and re-allocate on rejection. **Built and tested**
+  (`utils/feasibility.py::fit_plan_to_budget`, `tests/test_feasibility.py`),
+  and invoked by `kadhi allocate`, so a plan the resource model would refuse is
+  re-allocated under a smaller budget or reported infeasible rather than emitted.
 - `controller:` configuration block. **Built** (schema-only, mirroring the
   `AdviseConfig` precedent exactly) — validated, tested, and its example YAML
   in `adaptation-controller.md` §4 round-trips through the real schema.
