@@ -34,6 +34,8 @@ console = Console()
 # unmapped quant (gptq/awq/...) means the predictor's bytes-per-param table
 # doesn't apply cleanly, so this command declines to guess rather than
 # silently mis-predicting VRAM.
+_R_MAX = 64  # plan_from_signals' default r_max: the allocator's per-layer rank ceiling
+
 _HW_FIT_QUANT = {"none": "none", "4bit": "4bit", "8bit": "8bit"}
 
 
@@ -72,12 +74,10 @@ def allocate_cmd(
         raise typer.Exit(1)
 
     budget = cfg.controller.budget
-    if budget.trainable_params is None:
+    if budget.trainable_params is None and budget.vram_gb is None:
         console.print(
-            "[red]controller.budget.trainable_params is required for "
-            "`kadhi allocate` today.[/] Inferring a parameter budget from "
-            "`vram_gb` alone is not yet implemented — set "
-            "`controller.budget.trainable_params` explicitly."
+            "[red]controller.budget needs `trainable_params` and/or `vram_gb`.[/] "
+            "With only `vram_gb`, the largest plan that fits the ceiling is searched for."
         )
         raise typer.Exit(1)
 
@@ -139,8 +139,18 @@ def allocate_cmd(
             )
 
         vram_gb = budget.vram_gb if budget.vram_gb is not None else 1_000_000.0
+        initial_budget = budget.trainable_params
+        if initial_budget is None:
+            # VRAM-only budget: start from the most the allocator could ever
+            # spend (every module at r_max) and let the feasibility bisection
+            # find the largest budget that fits the ceiling.
+            from kadhi_cli.utils.capacity import count_lora_trainable_params
+
+            initial_budget = count_lora_trainable_params(
+                shapes, default_r=_R_MAX, use_dora=lora_cfg.use_dora,
+            )
         result = fit_plan_to_budget(
-            build, shapes, initial_budget_params=budget.trainable_params,
+            build, shapes, initial_budget_params=initial_budget,
             use_dora=lora_cfg.use_dora, hardware_fit_base=hardware_fit_base,
             vram_gb=vram_gb,
         )
@@ -157,7 +167,11 @@ def allocate_cmd(
     summary.add_column("Value")
     summary.add_row("base", escape(cfg.base))
     summary.add_row("feasible", str(check.feasible))
-    summary.add_row("budget_params (requested)", str(budget.trainable_params))
+    summary.add_row(
+        "budget_params (requested)",
+        str(budget.trainable_params) if budget.trainable_params is not None
+        else f"inferred from vram_gb ({initial_budget:,} at uniform r={_R_MAX})",
+    )
     summary.add_row("budget_params (used)", str(result.budget_params_used))
     summary.add_row("trainable_params (exact)", str(check.trainable_params))
     summary.add_row("iterations", str(result.iterations))

@@ -337,7 +337,8 @@ first.**
 - `kadhi allocate --explain` CLI surface. **Built and tested end to end**
   (`commands/allocate.py`, registered in `cli.py`) — loads a real
   `kadhi.yaml`, requires `controller.enabled` and a `trainable_params`
-  budget, requires the base model to already be a local directory (no
+  and/or `vram_gb` budget (with `vram_gb` alone, the largest plan that fits the
+  ceiling is found by bisection from the uniform-r=64 cost), requires the base model to already be a local directory (no
   network fetch, consistent with the Phase 1 resource-model design), then
   runs `build_static_plan` inside `fit_plan_to_budget` and reports whether
   the result fits under `controller.budget.vram_gb`. `--explain` prints the

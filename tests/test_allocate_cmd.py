@@ -156,27 +156,37 @@ def test_allocate_cmd_requires_local_checkpoint(tmp_path, monkeypatch):
     assert "not a local directory" in result.output
 
 
-def test_allocate_cmd_requires_trainable_params_budget(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    _write_checkpoint(tmp_path)
+def _vram_only_config(tmp_path, budget_lines):
     data_path = tmp_path / "train.jsonl"
     data_path.write_text('{"messages": [{"role": "user", "content": "hi"}]}\n')
     cfg_path = tmp_path / "kadhi.yaml"
-    cfg_path.write_text(textwrap.dedent(f"""\
-        base: {tmp_path}
-        task: sft
-        data:
-          train: {data_path}
-          format: chatml
-        controller:
-          enabled: true
-          budget:
-            vram_gb: 4.0
-        """))
+    cfg_path.write_text("\n".join([
+        f"base: {tmp_path}", "task: sft", "data:", f"  train: {data_path}",
+        "  format: chatml", "training:", "  lora:", "    r: 8",
+        "    target_modules: [q_proj]", "controller:", "  enabled: true",
+        "  budget:", *budget_lines,
+    ]) + "\n")
+    return cfg_path
+
+
+def test_allocate_cmd_requires_some_budget(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_checkpoint(tmp_path)
+    cfg_path = _vram_only_config(tmp_path, ["    {}"])
 
     result = runner.invoke(app, ["allocate", "--config", str(cfg_path)])
     assert result.exit_code == 1, result.output
-    assert "trainable_params is required" in result.output
+    assert "needs" in result.output and "vram_gb" in result.output
+
+
+def test_allocate_cmd_infers_budget_from_vram_gb_alone(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_checkpoint(tmp_path)
+    cfg_path = _vram_only_config(tmp_path, ["    vram_gb: 1000000"])
+
+    result = runner.invoke(app, ["allocate", "--config", str(cfg_path)])
+    assert result.exit_code == 0, result.output
+    assert "inferred from" in result.output
 
 
 def test_allocate_cmd_registered_in_help():
