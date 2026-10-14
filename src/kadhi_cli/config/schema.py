@@ -993,8 +993,8 @@ class ControllerProbeConfig(BaseModel):
 
 class ControllerGrowthConfig(BaseModel):
     """In-place capacity growth settings (Phase 4 — see
-    adaptation-controller-plan.md §1.6). Schema-only: no growth loop is
-    wired to this block yet.
+    adaptation-controller-plan.md §1.6). Schema-only: the growth primitives
+    exist in utils/growth.py but no training loop is wired to this block yet.
     """
 
     enabled: bool = Field(
@@ -1013,17 +1013,16 @@ class ControllerConfig(BaseModel):
 
     Mirrors the ``AdviseConfig`` precedent immediately below: this surfaces
     the controller's knobs through ``kadhi.yaml`` so a config can carry them
-    persistently, ahead of the CLI command that will consume them
-    (``kadhi plan``, not yet built). ``utils/capacity.py``, ``utils/allocate.py``,
+    persistently, and is consumed by ``kadhi allocate``
+    (commands/allocate.py). ``utils/capacity.py``, ``utils/allocate.py``,
     and ``utils/sensitivity.py`` exist and are independently tested as of
-    this field's addition; nothing yet wires this config block to them —
-    setting ``enabled: true`` in a ``kadhi.yaml`` today has no runtime effect
-    beyond the validation below.
+    this field's addition. ``enabled`` and ``budget`` drive ``kadhi allocate``;
+    ``probe`` and ``growth`` are not yet consumed by any command.
     """
 
     enabled: bool = Field(
         default=False,
-        description="Turn the Adaptation Controller on. No-op until `kadhi plan` lands.",
+        description="Turn the Adaptation Controller on. Enables `kadhi allocate`.",
     )
     budget: ControllerBudgetConfig = Field(default_factory=ControllerBudgetConfig)
     probe: ControllerProbeConfig = Field(default_factory=ControllerProbeConfig)
@@ -4452,8 +4451,8 @@ class KadhiConfig(BaseModel):
     controller: Optional[ControllerConfig] = Field(
         default=None,
         description=(
-            "Adaptation Controller settings (schema-only — see "
-            "docs/adaptation-controller.md). Not yet consumed by any command."
+            "Adaptation Controller settings (see "
+            "docs/adaptation-controller.md). Consumed by `kadhi allocate` (budget)."
         ),
     )
 

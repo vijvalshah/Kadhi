@@ -276,8 +276,8 @@ int seconds duration — matching every other budget-shaped field elsewhere in
 `"4GB"`; no such parser exists anywhere else in this schema, so this block
 doesn't invent one just for itself. This YAML is real: `controller:` is a
 validated part of the schema today — see `ControllerConfig` in
-`config/schema.py` — though nothing yet reads it, since `kadhi allocate`
-below does not exist as a CLI command yet either. See
+`config/schema.py` — and `kadhi allocate` (below) reads `budget` and `enabled` today; `probe` and
+`growth` are not yet consumed by any command. See
 `adaptation-controller-plan.md` for exactly what is built versus proposed.)
 
 ```bash
