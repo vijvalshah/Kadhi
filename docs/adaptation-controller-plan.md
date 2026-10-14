@@ -372,15 +372,25 @@ is reported as one rather than tuned around. Not yet determined.
 
 ### Phase 4 — Growth and frontier reporting *(stretch)*
 
+**Status: the building blocks are written and tested (`utils/growth.py`,
+`tests/test_growth.py`, torch-free, numpy). They are not yet wired into a
+training loop, and the quality/wall-clock claim below has not been measured —
+that needs the GPU runs from Phases 1–3.**
+
 **Build**
-- In-place rank expansion with optimizer-state extension.
-- Convergence monitor driving growth against the phase-2 `ε`.
+- In-place rank expansion with optimizer-state extension. **Built and tested**
+  (`expand_lora_pair`, `extend_adam_state`): new `A` rows random, new `B`
+  columns zero, new Adam moments zero.
+- Convergence monitor driving growth against the phase-2 `ε`. **Built and tested**
+  (`ConvergenceMonitor`, `plan_growth_step`); `ε` must come from the Phase 2 run.
 - Frontier reporting over accumulated plans, reusing the existing non-dominated
-  selection and report format.
+  selection and report format. **Built and tested** (`frontier`, `format_frontier`,
+  same dominance rule as `tunability.pareto_frontier`).
 
 **Done when**
 - Growth preserves the model function exactly at the expansion step, verified
-  numerically.
+  numerically. **Met** — `test_expansion_preserves_function_exactly` asserts
+  bit-for-bit equality of `B @ A @ x` before and after expansion.
 - A grown plan reaches comparable quality to a directly trained equivalent at lower
   total wall-clock.
 
